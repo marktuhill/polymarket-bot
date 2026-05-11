@@ -212,8 +212,13 @@ def get_usdc_balance() -> Optional[float]:
     if not client:
         return None
     try:
-        import types as _t
-        resp = client.get_balance_allowance(_t.SimpleNamespace(asset_type="USDC"))
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        sig_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.COLLATERAL,
+            signature_type=sig_type,
+        )
+        resp = client.get_balance_allowance(params)
         if resp:
             raw = resp.get("balance") or resp.get("allowance", "0")
             return int(raw) / 1_000_000
