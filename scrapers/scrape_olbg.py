@@ -46,8 +46,10 @@ from playwright.async_api import async_playwright
 
 # ── config ────────────────────────────────────────────────────────────────────
 
-# Load .env from parent dir (tennis bot root)
-load_dotenv(Path(__file__).parent.parent / ".env")
+for _p in [Path(__file__).resolve().parent.parent / ".env", Path(".env")]:
+    if _p.exists():
+        load_dotenv(_p)
+        break
 
 TIPS_URL = "https://www.olbg.com/betting-tips/Tennis/3"
 USER_AGENT = (

@@ -19,7 +19,10 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
-load_dotenv(Path(__file__).parent.parent / ".env")
+for _p in [Path(__file__).resolve().parent.parent / ".env", Path(".env")]:
+    if _p.exists():
+        load_dotenv(_p)
+        break
 
 TIPS_URL   = "https://www.olbg.com/betting-tips/Tennis/3"
 DUMP_FILE  = Path(__file__).parent / "olbg_page_dump.html"
@@ -44,8 +47,9 @@ async def discover():
         page    = await context.new_page()
 
         print(f"Loading {TIPS_URL} ...")
+        timeout = 60000 if SCRAPERAPI_KEY else 30000
         try:
-            await page.goto(TIPS_URL, wait_until="load", timeout=30000)
+            await page.goto(TIPS_URL, wait_until="load", timeout=timeout)
         except Exception as e:
             print(f"  [WARN] goto raised: {e}")
 
