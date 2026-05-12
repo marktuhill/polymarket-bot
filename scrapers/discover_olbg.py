@@ -43,7 +43,8 @@ async def discover():
                  } if SCRAPERAPI_KEY else None
         if proxy:
             print(f"Using ScraperAPI proxy ...")
-        context = await browser.new_context(user_agent=USER_AGENT, proxy=proxy)
+        context = await browser.new_context(user_agent=USER_AGENT, proxy=proxy,
+                                            ignore_https_errors=bool(proxy))
         page    = await context.new_page()
 
         print(f"Loading {TIPS_URL} ...")

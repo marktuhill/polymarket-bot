@@ -324,7 +324,8 @@ async def scrape(deep: bool = False) -> list[TipSelection]:
         proxy = _proxy_config()
         if proxy:
             print(f"Using ScraperAPI proxy ...", file=sys.stderr)
-        context = await browser.new_context(user_agent=USER_AGENT, proxy=proxy)
+        context = await browser.new_context(user_agent=USER_AGENT, proxy=proxy,
+                                            ignore_https_errors=bool(proxy))
 
         # ── main page ──────────────────────────────────────────────────────
         page = await context.new_page()
