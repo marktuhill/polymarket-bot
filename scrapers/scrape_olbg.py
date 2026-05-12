@@ -33,6 +33,7 @@ Output fields (per tip selection):
 
 import asyncio
 import json
+import os
 import re
 import sys
 from dataclasses import asdict, dataclass, field
@@ -40,9 +41,13 @@ from pathlib import Path
 from typing import Optional
 
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
 # ── config ────────────────────────────────────────────────────────────────────
+
+# Load .env from parent dir (tennis bot root)
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 TIPS_URL = "https://www.olbg.com/betting-tips/Tennis/3"
 USER_AGENT = (
@@ -52,6 +57,17 @@ USER_AGENT = (
 )
 MAIN_PAGE_WAIT_S = 8   # seconds after page load for JS to fully render
 MATCH_PAGE_WAIT_S = 4  # seconds for individual match pages
+
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "")
+
+def _proxy_config() -> Optional[dict]:
+    if not SCRAPERAPI_KEY:
+        return None
+    return {
+        "server":   "http://proxy-server.scraperapi.com:8001",
+        "username": "scraperapi",
+        "password": SCRAPERAPI_KEY,
+    }
 
 
 # ── data models ───────────────────────────────────────────────────────────────
@@ -303,7 +319,10 @@ def parse_match_page(html: str, consensus_selection: str) -> list[TipsterRecord]
 async def scrape(deep: bool = False) -> list[TipSelection]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent=USER_AGENT)
+        proxy = _proxy_config()
+        if proxy:
+            print(f"Using ScraperAPI proxy ...", file=sys.stderr)
+        context = await browser.new_context(user_agent=USER_AGENT, proxy=proxy)
 
         # ── main page ──────────────────────────────────────────────────────
         page = await context.new_page()

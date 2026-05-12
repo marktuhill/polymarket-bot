@@ -10,12 +10,16 @@ Usage:
 """
 
 import asyncio
+import os
 import re
 import sys
 from pathlib import Path
 
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from playwright.async_api import async_playwright
+
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 TIPS_URL   = "https://www.olbg.com/betting-tips/Tennis/3"
 DUMP_FILE  = Path(__file__).parent / "olbg_page_dump.html"
@@ -25,12 +29,18 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 WAIT_S = 10
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "")
 
 
 async def discover():
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent=USER_AGENT)
+        proxy = {"server": "http://proxy-server.scraperapi.com:8001",
+                 "username": "scraperapi", "password": SCRAPERAPI_KEY
+                 } if SCRAPERAPI_KEY else None
+        if proxy:
+            print(f"Using ScraperAPI proxy ...")
+        context = await browser.new_context(user_agent=USER_AGENT, proxy=proxy)
         page    = await context.new_page()
 
         print(f"Loading {TIPS_URL} ...")
