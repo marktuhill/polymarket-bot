@@ -22,6 +22,22 @@ from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
 
+# NordVPN SOCKS5 — routes only Polymarket API calls through a US residential IP
+_NORD_USER   = os.getenv("NORD_USER", "yojfhwXz4Fd9c2udbgpcpQq7")
+_NORD_PASS   = os.getenv("NORD_PASS", "HE8s7fB1pe13FrAaLdAEgUnr")
+_NORD_SERVER = os.getenv("NORD_SERVER", "us5148.nordvpn.com")  # US SOCKS5 server
+
+def _patch_socks_proxy():
+    """Monkey-patch httpx/requests to route through NordVPN SOCKS5."""
+    if not _NORD_USER or not _NORD_PASS:
+        return
+    proxy_url = f"socks5://{_NORD_USER}:{_NORD_PASS}@{_NORD_SERVER}:1080"
+    os.environ.setdefault("ALL_PROXY",   proxy_url)
+    os.environ.setdefault("HTTPS_PROXY", proxy_url)
+    os.environ.setdefault("HTTP_PROXY",  proxy_url)
+
+_patch_socks_proxy()
+
 # ── .env discovery (tennis bot lives in a different dir from .env) ────────
 _ENV_CANDIDATES = [
     Path(r"C:\CUsersMarkpolymarket-momentum-bot\.env"),
