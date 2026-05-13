@@ -22,21 +22,25 @@ from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
 
-# NordVPN SOCKS5 — routes only Polymarket API calls through a US residential IP
-_NORD_USER   = os.getenv("NORD_USER", "yojfhwXz4Fd9c2udbgpcpQq7")
-_NORD_PASS   = os.getenv("NORD_PASS", "HE8s7fB1pe13FrAaLdAEgUnr")
-_NORD_SERVER = os.getenv("NORD_SERVER", "us5148.nordvpn.com")  # US SOCKS5 server
+# NordVPN SOCKS5 — routes ONLY clob.polymarket.com through a US residential IP
+_NORD_USER   = os.getenv("NORD_USER",   "yojfhwXz4Fd9c2udbgpcpQq7")
+_NORD_PASS   = os.getenv("NORD_PASS",   "HE8s7fB1pe13FrAaLdAEgUnr")
+_NORD_SERVER = os.getenv("NORD_SERVER", "us5148.nordvpn.com")
 
-def _patch_socks_proxy():
-    """Monkey-patch httpx/requests to route through NordVPN SOCKS5."""
+def _patch_polymarket_proxy():
+    """Patch httpx.Client so only Polymarket CLOB calls use the Nord SOCKS5 proxy."""
     if not _NORD_USER or not _NORD_PASS:
         return
-    proxy_url = f"socks5://{_NORD_USER}:{_NORD_PASS}@{_NORD_SERVER}:1080"
-    os.environ.setdefault("ALL_PROXY",   proxy_url)
-    os.environ.setdefault("HTTPS_PROXY", proxy_url)
-    os.environ.setdefault("HTTP_PROXY",  proxy_url)
+    import httpx as _httpx
+    _proxy_url  = f"socks5://{_NORD_USER}:{_NORD_PASS}@{_NORD_SERVER}:1080"
+    _orig_init  = _httpx.Client.__init__
+    def _patched_init(self, *args, **kwargs):
+        if "proxies" not in kwargs and "proxy" not in kwargs and "mounts" not in kwargs:
+            kwargs["proxies"] = {"https://clob.polymarket.com": _proxy_url}
+        _orig_init(self, *args, **kwargs)
+    _httpx.Client.__init__ = _patched_init
 
-_patch_socks_proxy()
+_patch_polymarket_proxy()
 
 # ── .env discovery (tennis bot lives in a different dir from .env) ────────
 _ENV_CANDIDATES = [
