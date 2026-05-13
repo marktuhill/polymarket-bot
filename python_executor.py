@@ -22,25 +22,30 @@ from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
 
-# NordVPN SOCKS5 — routes ONLY clob.polymarket.com through a US residential IP
+# NordVPN SOCKS5 — routes Polymarket CLOB API calls through a US residential IP
 _NORD_USER   = os.getenv("NORD_USER",   "yojfhwXz4Fd9c2udbgpcpQq7")
 _NORD_PASS   = os.getenv("NORD_PASS",   "HE8s7fB1pe13FrAaLdAEgUnr")
 _NORD_SERVER = os.getenv("NORD_SERVER", "us5148.nordvpn.com")
 
-def _patch_polymarket_proxy():
-    """Patch httpx.Client so only Polymarket CLOB calls use the Nord SOCKS5 proxy."""
-    if not _NORD_USER or not _NORD_PASS:
-        return
-    import httpx as _httpx
-    _proxy_url  = f"socks5://{_NORD_USER}:{_NORD_PASS}@{_NORD_SERVER}:1080"
-    _orig_init  = _httpx.Client.__init__
-    def _patched_init(self, *args, **kwargs):
-        if "proxies" not in kwargs and "proxy" not in kwargs and "mounts" not in kwargs:
-            kwargs["proxies"] = {"https://clob.polymarket.com": _proxy_url}
-        _orig_init(self, *args, **kwargs)
-    _httpx.Client.__init__ = _patched_init
 
-_patch_polymarket_proxy()
+def _inject_nord_proxy(clob_client) -> bool:
+    """Replace the httpx.Client inside ClobClient with a SOCKS5-proxied one."""
+    if not _NORD_USER or not _NORD_PASS:
+        return False
+    import httpx
+    proxy_url = f"socks5://{_NORD_USER}:{_NORD_PASS}@{_NORD_SERVER}:1080"
+    for attr in ("_client", "client", "_http_client", "session"):
+        inner = getattr(clob_client, attr, None)
+        if isinstance(inner, httpx.Client):
+            setattr(clob_client, attr, httpx.Client(
+                proxies={"https://": proxy_url},
+                headers=dict(inner.headers),
+                timeout=inner.timeout,
+            ))
+            logger.info(f"python_executor: Nord SOCKS5 proxy injected ({_NORD_SERVER})")
+            return True
+    logger.warning("python_executor: could not inject proxy — httpx client attr not found")
+    return False
 
 # ── .env discovery (tennis bot lives in a different dir from .env) ────────
 _ENV_CANDIDATES = [
@@ -97,6 +102,7 @@ def _get_client() -> Optional[ClobClient]:
             funder=funder,
             creds=creds,
         )
+        _inject_nord_proxy(_client)
         logger.info("python_executor: ClobClient ready")
         return _client
     except Exception as e:
