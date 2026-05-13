@@ -3,12 +3,6 @@ Python CLOB Executor
 =====================
 Direct Polymarket order placement via py-clob-client.
 Drop-in replacement for the Node.js executor subprocess.
-
-Initialises a single ClobClient at import time and reuses it for
-every order — no subprocess startup overhead (~0ms vs ~500ms).
-
-Copied from C:/CUsersMarkpolymarket-momentum-bot/python_executor.py
-and modified to discover .env from the correct path for the tennis bot.
 """
 
 import os
@@ -19,35 +13,8 @@ from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
 
-# NordVPN SOCKS5 — routes Polymarket CLOB API calls through a US residential IP
-_NORD_USER   = os.getenv("NORD_USER",   "yojfhwXz4Fd9c2udbgpcpQq7")
-_NORD_PASS   = os.getenv("NORD_PASS",   "HE8s7fB1pe13FrAaLdAEgUnr")
-_NORD_SERVER = os.getenv("NORD_SERVER", "us5148.nordvpn.com")
-
-
-def _inject_nord_proxy(clob_client) -> bool:
-    """Replace the httpx.Client inside ClobClient with a SOCKS5-proxied one."""
-    if not _NORD_USER or not _NORD_PASS:
-        return False
-    import httpx
-    proxy_url = f"socks5://{_NORD_USER}:{_NORD_PASS}@{_NORD_SERVER}:1080"
-    for attr in ("_client", "client", "_http_client", "session"):
-        inner = getattr(clob_client, attr, None)
-        if isinstance(inner, httpx.Client):
-            setattr(clob_client, attr, httpx.Client(
-                proxies={"https://": proxy_url},
-                headers=dict(inner.headers),
-                timeout=inner.timeout,
-            ))
-            logger.info(f"python_executor: Nord SOCKS5 proxy injected ({_NORD_SERVER})")
-            return True
-    logger.warning("python_executor: could not inject proxy — httpx client attr not found")
-    return False
-
-# ── .env discovery (tennis bot lives in a different dir from .env) ────────
+# ── .env discovery ────────────────────────────────────────────────────────────
 _ENV_CANDIDATES = [
     Path(r"C:\CUsersMarkpolymarket-momentum-bot\.env"),
     Path(r"C:\Users\markt\polymarket-momentum-bot\.env"),
@@ -59,14 +26,38 @@ for _p in _ENV_CANDIDATES:
         load_dotenv(_p)
         break
 
+# ── NordVPN SOCKS5 proxy — patch httpx BEFORE importing py_clob_client ───────
+# py_clob_client does `from httpx import Client` at import time, so we must
+# replace httpx.Client in the httpx module namespace first.
+_NORD_USER   = os.getenv("NORD_USER",   "yojfhwXz4Fd9c2udbgpcpQq7")
+_NORD_PASS   = os.getenv("NORD_PASS",   "HE8s7fB1pe13FrAaLdAEgUnr")
+_NORD_SERVER = os.getenv("NORD_SERVER", "us5148.nordvpn.com")
+
+if _NORD_USER and _NORD_PASS:
+    import httpx as _httpx
+    _NORD_PROXY = f"socks5://{_NORD_USER}:{_NORD_PASS}@{_NORD_SERVER}:1080"
+    _OrigHttpxClient = _httpx.Client
+
+    class _NordClient(_OrigHttpxClient):
+        def __init__(self, *args, **kwargs):
+            if "proxies" not in kwargs and "proxy" not in kwargs and "mounts" not in kwargs:
+                kwargs["proxies"] = {"https://": _NORD_PROXY}
+            super().__init__(*args, **kwargs)
+
+    _httpx.Client = _NordClient
+
+# ── NOW import py_clob_client — it will pick up the patched httpx.Client ─────
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+
 logger = logging.getLogger(__name__)
 
 CLOB_HOST = "https://clob.polymarket.com"
-CHAIN_ID  = 137   # Polygon mainnet
-TICK      = 0.01  # Minimum price increment on Polymarket
+CHAIN_ID  = 137
+TICK      = 0.01
 
 # ─────────────────────────────────────────────
-# Singleton client — built once at import time
+# Singleton client
 # ─────────────────────────────────────────────
 
 _client: Optional[ClobClient] = None
@@ -77,12 +68,12 @@ def _get_client() -> Optional[ClobClient]:
     if _client is not None:
         return _client
 
-    pk           = os.getenv("POLYMARKET_PK", "")
-    funder       = os.getenv("POLYMARKET_FUNDER", "")
-    sig_type     = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))
-    api_key      = os.getenv("POLYMARKET_API_KEY", "")
-    api_secret   = os.getenv("POLYMARKET_API_SECRET", "")
-    passphrase   = os.getenv("POLYMARKET_PASSPHRASE", "")
+    pk         = os.getenv("POLYMARKET_PK", "")
+    funder     = os.getenv("POLYMARKET_FUNDER", "")
+    sig_type   = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))
+    api_key    = os.getenv("POLYMARKET_API_KEY", "")
+    api_secret = os.getenv("POLYMARKET_API_SECRET", "")
+    passphrase = os.getenv("POLYMARKET_PASSPHRASE", "")
 
     if not all([pk, funder, api_key, api_secret, passphrase]):
         logger.error("python_executor: missing .env credentials")
@@ -102,8 +93,8 @@ def _get_client() -> Optional[ClobClient]:
             funder=funder,
             creds=creds,
         )
-        _inject_nord_proxy(_client)
-        logger.info("python_executor: ClobClient ready")
+        nord_status = f"via Nord ({_NORD_SERVER})" if _NORD_USER else "direct"
+        logger.info(f"python_executor: ClobClient ready [{nord_status}]")
         return _client
     except Exception as e:
         logger.error(f"python_executor: client init failed: {e}")
@@ -116,16 +107,6 @@ def _get_client() -> Optional[ClobClient]:
 
 def place_order(side: str, token_id: str, price: float, shares: int,
                 expiry_sec: int = 0) -> Optional[str]:
-    """
-    Place a GTD limit order (auto-expires) if expiry_sec > 0, else GTC.
-
-    side       : "BUY" or "SELL"
-    price      : limit price (rounded to nearest $0.01 tick)
-    shares     : number of shares (minimum 5)
-    expiry_sec : seconds until auto-cancel (0 = GTC, no expiry)
-
-    Returns order ID string on success, None on failure.
-    """
     client = _get_client()
     if not client:
         return None
