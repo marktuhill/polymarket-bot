@@ -48,14 +48,13 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stderr),
-        logging.FileHandler(ROOT / "logs" / "tennis_bot.log",
-                            encoding="utf-8", errors="replace"),
-    ],
+)
+(ROOT / "logs").mkdir(exist_ok=True)
+logging.getLogger().addHandler(
+    logging.FileHandler(ROOT / "logs" / "tennis_bot.log",
+                        encoding="utf-8", errors="replace")
 )
 log = logging.getLogger("tennis_bot")
-(ROOT / "logs").mkdir(exist_ok=True)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
