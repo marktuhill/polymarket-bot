@@ -26,27 +26,23 @@ for _p in _ENV_CANDIDATES:
         load_dotenv(_p)
         break
 
-# ── NordVPN SOCKS5 proxy — patch httpx BEFORE importing py_clob_client ───────
-# Routes Polymarket CLOB API calls through NordVPN residential IP.
-# py_clob_client does `from httpx import Client` at import time, so we must
-# replace httpx.Client in the httpx module namespace first.
+# ── Proxy patch — must happen BEFORE importing py_clob_client ────────────────
+# py_clob_client creates httpx.Client at module level; patch the class first.
 #
-# NORD_SOCKS5_SERVER: find a US server at nordvpn.com/servers/tools/
-# (filter by Country=US, Protocol=SOCKS5). Use the hostname shown there.
-_NORD_USER   = os.getenv("NORDVPN_USER", "yojfhwXz4Fd9c2udbgpcpQq7")
-_NORD_PASS   = os.getenv("NORDVPN_PASS", "HE8s7fB1pe13FrAaLdAEgUnr")
-_NORD_SERVER = os.getenv("NORDVPN_SERVER", "us4532.nordvpn.com")
-
-_CLOB_PROXY = f"socks5://{_NORD_USER}:{_NORD_PASS}@{_NORD_SERVER}:1080"
+# Set CLOB_PROXY in .env to any proxy URL, e.g.:
+#   http://user:pass@p.webshare.io:80        (Webshare residential)
+#   socks5://user:pass@host:1080             (SOCKS5)
+# Leave unset to connect directly (only works on non-datacenter IPs).
+_CLOB_PROXY = os.getenv("CLOB_PROXY", "")
 
 import httpx as _httpx
 _OrigHttpxClient = _httpx.Client
 
 class _ProxiedClient(_OrigHttpxClient):
     def __init__(self, *args, **kwargs):
-        if "proxy" not in kwargs and "mounts" not in kwargs:
+        if _CLOB_PROXY and "proxy" not in kwargs and "mounts" not in kwargs:
             kwargs["proxy"]  = _CLOB_PROXY
-            kwargs["http2"]  = False   # HTTP/2 conflicts with SOCKS5 proxies
+            kwargs["http2"]  = False   # HTTP/2 conflicts with proxy tunnels
         super().__init__(*args, **kwargs)
 
 _httpx.Client = _ProxiedClient
@@ -98,7 +94,7 @@ def _get_client() -> Optional[ClobClient]:
             funder=funder,
             creds=creds,
         )
-        proxy_status = f"via NordVPN SOCKS5 ({_NORD_SERVER})"
+        proxy_status = f"via proxy ({_CLOB_PROXY.split('@')[-1]})" if _CLOB_PROXY else "direct"
         logger.info(f"python_executor: ClobClient ready [{proxy_status}]")
         return _client
     except Exception as e:
