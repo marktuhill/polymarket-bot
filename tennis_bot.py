@@ -186,7 +186,7 @@ def _daily_pnl() -> tuple[float, int, int]:
                 if status == "DRY_RUN":
                     continue
 
-                if not resolved:
+                if not resolved and status != "FAILED":
                     open_count += 1
                 elif resolved.startswith(today) and pnl_str:
                     try:
@@ -210,7 +210,8 @@ def _open_condition_ids() -> set[str]:
     try:
         with open(LIVE_CSV, encoding="utf-8") as f:
             for row in csv.DictReader(f):
-                if row.get("status", "").strip() == "DRY_RUN":
+                status = row.get("status", "").strip()
+                if status in ("DRY_RUN", "FAILED"):
                     continue
                 if not row.get("resolved", "").strip():
                     ids.add(row.get("condition_id", ""))
