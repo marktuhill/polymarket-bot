@@ -41,7 +41,8 @@ if _SCRAPERAPI_KEY:
         def __init__(self, *args, **kwargs):
             if "proxy" not in kwargs and "mounts" not in kwargs:
                 kwargs["proxy"]  = _CLOB_PROXY
-                kwargs["verify"] = False   # ScraperAPI terminates TLS with its own cert
+                kwargs["verify"] = False
+                kwargs["http2"]  = False   # HTTP/2 conflicts with HTTP CONNECT proxies
             super().__init__(*args, **kwargs)
 
     _httpx.Client = _ProxiedClient
@@ -152,6 +153,8 @@ def place_order(side: str, token_id: str, price: float, shares: int,
         return None
 
     except Exception as e:
+        import traceback as _tb
+        logger.debug(f"  python_executor: order traceback:\n{_tb.format_exc()}")
         err = str(e)
         if "400" in err and "not enough balance" in err and side == "SELL":
             import re as _re
