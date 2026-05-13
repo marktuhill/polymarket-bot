@@ -40,8 +40,8 @@ if _NORD_USER and _NORD_PASS:
 
     class _NordClient(_OrigHttpxClient):
         def __init__(self, *args, **kwargs):
-            if "proxies" not in kwargs and "proxy" not in kwargs and "mounts" not in kwargs:
-                kwargs["proxies"] = {"https://": _NORD_PROXY}
+            if "proxy" not in kwargs and "mounts" not in kwargs:
+                kwargs["proxy"] = _NORD_PROXY
             super().__init__(*args, **kwargs)
 
     _httpx.Client = _NordClient
