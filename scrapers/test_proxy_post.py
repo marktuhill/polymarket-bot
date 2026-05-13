@@ -1,56 +1,63 @@
 """
-Tests multiple routing strategies for POST to Polymarket CLOB API.
-ScraperAPI proxy mode times out; testing API-endpoint mode and ultra_premium.
+Tests NordVPN SOCKS5 proxy for POST to Polymarket CLOB API.
+Run after opening outbound TCP 1080 in Windows Firewall (wf.msc).
 """
 import httpx
 
-KEY = "f4bf5987abe7be581dccf7dc52998dc7"
 TARGET = "https://clob.polymarket.com/order"
 
-# ── 1. ScraperAPI proxy mode (standard / premium / ultra_premium) ─────────────
-proxy_variants = {
-    "proxy-standard":       f"http://scraperapi:{KEY}@proxy-server.scraperapi.com:8001",
-    "proxy-premium":        f"http://scraperapi.premium:{KEY}@proxy-server.scraperapi.com:8001",
-    "proxy-ultra_premium":  f"http://scraperapi.ultra_premium:{KEY}@proxy-server.scraperapi.com:8001",
-}
+NORD_USER   = "yojfhwXz4Fd9c2udbgpcpQq7"
+NORD_PASS   = "HE8s7fB1pe13FrAaLdAEgUnr"
+NORD_SERVER = "us4532.nordvpn.com"   # US server supporting SOCKS5 on port 1080
 
-for label, proxy in proxy_variants.items():
-    print(f"\nTesting [{label}] ...")
-    try:
-        r = httpx.post(TARGET, proxy=proxy, json={}, verify=False, timeout=60)
-        print(f"  Status : {r.status_code}")
-        print(f"  Body   : {r.text[:300]}")
-    except Exception as e:
-        print(f"  Exception: {type(e).__name__}: {e}")
+NORD_PROXY  = f"socks5://{NORD_USER}:{NORD_PASS}@{NORD_SERVER}:1080"
 
-# ── 2. ScraperAPI API-endpoint mode (GET wrapper, premium=true) ───────────────
-# Different approach: we POST to ScraperAPI's own endpoint which relays the request.
-api_variants = {
-    "api-standard":      {"api_key": KEY, "url": TARGET},
-    "api-premium":       {"api_key": KEY, "url": TARGET, "premium": "true"},
-    "api-ultra_premium": {"api_key": KEY, "url": TARGET, "ultra_premium": "true"},
-}
-
-for label, params in api_variants.items():
-    print(f"\nTesting [{label}] ...")
-    try:
-        r = httpx.post(
-            "https://api.scraperapi.com/",
-            params=params,
-            json={},
-            headers={"Content-Type": "application/json"},
-            timeout=60,
-        )
-        print(f"  Status : {r.status_code}")
-        print(f"  Body   : {r.text[:300]}")
-    except Exception as e:
-        print(f"  Exception: {type(e).__name__}: {e}")
-
-# ── 3. Direct (no proxy) — baseline to confirm VPS IP is actually blocked ─────
-print(f"\nTesting [direct-no-proxy] ...")
+# ── 1. NordVPN SOCKS5 POST to Polymarket ─────────────────────────────────────
+print(f"\nTesting [Nord SOCKS5 POST] {TARGET} ...")
+print(f"  Proxy: {NORD_SERVER}:1080")
 try:
-    r = httpx.post(TARGET, json={}, timeout=15)
+    r = httpx.post(TARGET, proxy=NORD_PROXY, json={}, timeout=30)
     print(f"  Status : {r.status_code}")
     print(f"  Body   : {r.text[:300]}")
+    if r.status_code in (400, 401, 422):
+        print("  ✓ PROXY WORKS — Polymarket is responding (auth/validation error expected on empty body)")
+    elif r.status_code == 403:
+        print("  ✗ Still geo-blocked — try a different NordVPN server (see note below)")
+    else:
+        print(f"  ? Unexpected status — inspect body above")
 except Exception as e:
     print(f"  Exception: {type(e).__name__}: {e}")
+    if "timed out" in str(e).lower() or "timeout" in str(e).lower():
+        print("  ✗ Port 1080 still blocked — check Windows Firewall outbound rule was saved")
+    elif "connection refused" in str(e).lower():
+        print("  ✗ NordVPN server refused — try a different server hostname")
+
+# ── 2. Check what IP the proxy presents ──────────────────────────────────────
+print(f"\nTesting [Nord SOCKS5 GET ipinfo] checking outbound IP ...")
+try:
+    r = httpx.get("https://ipinfo.io/json", proxy=NORD_PROXY, timeout=15)
+    info = r.json()
+    print(f"  IP     : {info.get('ip')}")
+    print(f"  Org    : {info.get('org')}")
+    print(f"  City   : {info.get('city')}, {info.get('region')}, {info.get('country')}")
+    if info.get("org", "").lower().startswith("as54854"):
+        print("  ✓ Nord residential IP — should bypass Polymarket geo-block")
+    else:
+        print("  ✓ IP visible above — if org shows M247/datacenter, try a different Nord server")
+except Exception as e:
+    print(f"  Exception: {type(e).__name__}: {e}")
+
+# ── 3. Direct baseline ────────────────────────────────────────────────────────
+print(f"\nTesting [direct no proxy] ...")
+try:
+    r = httpx.post(TARGET, json={}, timeout=10)
+    print(f"  Status : {r.status_code}  (expected 403 — VPS IP geo-blocked)")
+except Exception as e:
+    print(f"  Exception: {type(e).__name__}: {e}")
+
+print("""
+NOTE: If Nord SOCKS5 still returns 403, the server may not have a residential IP.
+Try a different server — visit: nordvpn.com/servers/tools/
+  → Country: United States  → Protocol: SOCKS5
+Copy a hostname (e.g. us6700.nordvpn.com) and set NORDVPN_SERVER=<hostname> in your .env
+""")

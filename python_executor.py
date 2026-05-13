@@ -26,26 +26,30 @@ for _p in _ENV_CANDIDATES:
         load_dotenv(_p)
         break
 
-# ── ScraperAPI proxy — patch httpx BEFORE importing py_clob_client ───────────
-# Routes Polymarket CLOB API calls through ScraperAPI residential IPs.
+# ── NordVPN SOCKS5 proxy — patch httpx BEFORE importing py_clob_client ───────
+# Routes Polymarket CLOB API calls through NordVPN residential IP.
 # py_clob_client does `from httpx import Client` at import time, so we must
 # replace httpx.Client in the httpx module namespace first.
-_SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "f4bf5987abe7be581dccf7dc52998dc7")
+#
+# NORD_SOCKS5_SERVER: find a US server at nordvpn.com/servers/tools/
+# (filter by Country=US, Protocol=SOCKS5). Use the hostname shown there.
+_NORD_USER   = os.getenv("NORDVPN_USER", "yojfhwXz4Fd9c2udbgpcpQq7")
+_NORD_PASS   = os.getenv("NORDVPN_PASS", "HE8s7fB1pe13FrAaLdAEgUnr")
+_NORD_SERVER = os.getenv("NORDVPN_SERVER", "us4532.nordvpn.com")
 
-if _SCRAPERAPI_KEY:
-    import httpx as _httpx
-    _CLOB_PROXY = f"http://scraperapi:{_SCRAPERAPI_KEY}@proxy-server.scraperapi.com:8001"
-    _OrigHttpxClient = _httpx.Client
+_CLOB_PROXY = f"socks5://{_NORD_USER}:{_NORD_PASS}@{_NORD_SERVER}:1080"
 
-    class _ProxiedClient(_OrigHttpxClient):
-        def __init__(self, *args, **kwargs):
-            if "proxy" not in kwargs and "mounts" not in kwargs:
-                kwargs["proxy"]  = _CLOB_PROXY
-                kwargs["verify"] = False
-                kwargs["http2"]  = False   # HTTP/2 conflicts with HTTP CONNECT proxies
-            super().__init__(*args, **kwargs)
+import httpx as _httpx
+_OrigHttpxClient = _httpx.Client
 
-    _httpx.Client = _ProxiedClient
+class _ProxiedClient(_OrigHttpxClient):
+    def __init__(self, *args, **kwargs):
+        if "proxy" not in kwargs and "mounts" not in kwargs:
+            kwargs["proxy"]  = _CLOB_PROXY
+            kwargs["http2"]  = False   # HTTP/2 conflicts with SOCKS5 proxies
+        super().__init__(*args, **kwargs)
+
+_httpx.Client = _ProxiedClient
 
 # ── NOW import py_clob_client — it will pick up the patched httpx.Client ─────
 from py_clob_client.client import ClobClient
@@ -94,7 +98,7 @@ def _get_client() -> Optional[ClobClient]:
             funder=funder,
             creds=creds,
         )
-        proxy_status = "via ScraperAPI" if _SCRAPERAPI_KEY else "direct"
+        proxy_status = f"via NordVPN SOCKS5 ({_NORD_SERVER})"
         logger.info(f"python_executor: ClobClient ready [{proxy_status}]")
         return _client
     except Exception as e:
