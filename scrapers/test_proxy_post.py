@@ -6,7 +6,7 @@ URL   = "https://clob.polymarket.com/order"
 
 print(f"Testing POST {URL} via ScraperAPI proxy...")
 try:
-    r = httpx.post(URL, proxy=PROXY, json={}, verify=False, http2=False, timeout=30)
+    r = httpx.post(URL, proxy=PROXY, json={}, verify=False, timeout=30)
     print(f"Status : {r.status_code}")
     print(f"Body   : {r.text[:500]}")
 except Exception as e:
