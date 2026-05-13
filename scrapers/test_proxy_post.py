@@ -1,15 +1,20 @@
 import httpx
 import traceback
 
-PROXY = "http://scraperapi:f4bf5987abe7be581dccf7dc52998dc7@proxy-server.scraperapi.com:8001"
-URL   = "https://clob.polymarket.com/order"
+KEY = "f4bf5987abe7be581dccf7dc52998dc7"
+URL = "https://clob.polymarket.com/order"
 
-print(f"Testing POST {URL} via ScraperAPI proxy...")
-try:
-    r = httpx.post(URL, proxy=PROXY, json={}, verify=False, timeout=30)
-    print(f"Status : {r.status_code}")
-    print(f"Body   : {r.text[:500]}")
-except Exception as e:
-    print(f"Exception type : {type(e).__name__}")
-    print(f"Exception      : {e}")
-    traceback.print_exc()
+proxies = {
+    "standard": f"http://scraperapi:{KEY}@proxy-server.scraperapi.com:8001",
+    "premium":  f"http://scraperapi.premium:{KEY}@proxy-server.scraperapi.com:8001",
+}
+
+for label, proxy in proxies.items():
+    print(f"\nTesting [{label}] POST {URL}...")
+    try:
+        r = httpx.post(URL, proxy=proxy, json={}, verify=False, timeout=30)
+        print(f"  Status : {r.status_code}")
+        print(f"  Body   : {r.text[:300]}")
+    except Exception as e:
+        print(f"  Exception: {type(e).__name__}: {e}")
+
