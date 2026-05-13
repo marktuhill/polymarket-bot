@@ -154,7 +154,7 @@ def place_order(side: str, token_id: str, price: float, shares: int,
 
     except Exception as e:
         import traceback as _tb
-        logger.debug(f"  python_executor: order traceback:\n{_tb.format_exc()}")
+        logger.error(f"  python_executor: order traceback:\n{_tb.format_exc()}")
         err = str(e)
         if "400" in err and "not enough balance" in err and side == "SELL":
             import re as _re
