@@ -423,25 +423,34 @@ def load_active_outright_markets(session: requests.Session,
     pages_fetched = 0
 
     for page in range(5):                       # up to 500 events
-        try:
-            r = session.get(
-                f"{GAMMA_API}/events",
-                params={
-                    "tag_slug": "tennis",
-                    "active":   "true",
-                    "closed":   "false",
-                    "limit":    100,
-                    "offset":   page * 100,
-                },
-                timeout=15,
-            )
-            if r.status_code != 200:
+        last_err = None
+        for attempt in range(3):               # retry up to 3x with backoff
+            try:
+                r = session.get(
+                    f"{GAMMA_API}/events",
+                    params={
+                        "tag_slug": "tennis",
+                        "active":   "true",
+                        "closed":   "false",
+                        "limit":    100,
+                        "offset":   page * 100,
+                    },
+                    timeout=30,
+                )
+                if r.status_code != 200:
+                    break
+                events = r.json()
+                if not isinstance(events, list) or not events:
+                    break
+                last_err = None
                 break
-            events = r.json()
-            if not isinstance(events, list) or not events:
-                break
-        except Exception as e:
-            print(f"[WARN] Gamma bulk-load page {page}: {e}", file=sys.stderr)
+            except Exception as e:
+                last_err = e
+                import time as _t; _t.sleep(2 ** attempt)
+        if last_err:
+            print(f"[WARN] Gamma bulk-load page {page}: {last_err}", file=sys.stderr)
+            break
+        if r.status_code != 200 or not isinstance(events, list) or not events:
             break
 
         pages_fetched += 1
