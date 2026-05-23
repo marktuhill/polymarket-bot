@@ -27,7 +27,8 @@ What it does
   reclaim of a broken level (BREAK_FILTER). Each zone alerts once per approach
   (de-dup with hysteresis until price leaves and re-approaches).
 * Every alert includes exact order levels (entry / stop / target / R:R) printed
-  to the pair's native Binance tick size.
+  to the pair's native Binance tick size. Entry is the level, target the opposite
+  level, and the stop sits just beyond the level's wick extreme (STOP_BUFFER_ATR).
 
 Dependencies: ``requests`` plus the Python standard library only. No pandas,
 no numpy.
@@ -45,7 +46,10 @@ Optional (defaults in parentheses):
     SWING_STRENGTH       (2)         bars on each side that define a swing point
     ZONE_ATR_MULT        (0.5)       cluster swings within this * ATR into a zone
     ALERT_ATR_MULT       (0.25)      alert when within this * ATR of a boundary
-    STOP_ATR_MULT        (1.0)       stop distance beyond the zone, in ATR
+    STOP_BUFFER_ATR      (0.1)       stop sits this * ATR beyond the level's wick
+                                     extreme (tight, structure-based stop)
+    STOP_ATR_MULT        (1.0)       fallback stop distance in ATR (only used if
+                                     wick data is missing)
     MAX_RANGE_ATR_MULT   (3.0)       reject ranges wider than this * ATR (keeps
                                      them tight enough to round-trip intraday)
     MAX_RANGE_PCT        (8.0)       reject ranges wider than this % of price
@@ -185,6 +189,7 @@ def get_config():
         "zone_atr_mult": _env_float("ZONE_ATR_MULT", 0.5),
         "alert_atr_mult": _env_float("ALERT_ATR_MULT", 0.25),
         "stop_atr_mult": _env_float("STOP_ATR_MULT", 1.0),
+        "stop_buffer_atr": _env_float("STOP_BUFFER_ATR", 0.1),
         "max_range_atr_mult": _env_float("MAX_RANGE_ATR_MULT", 3.0),
         "max_range_pct": _env_float("MAX_RANGE_PCT", 8.0),
         "min_touches": _env_int("MIN_TOUCHES", 2),
@@ -552,6 +557,10 @@ def detect_range(symbol, bars, config):
         "support": sup_level,
         "resistance": res_level,
         "atr": atr,
+        # Actual wick extremes of the swings that formed each level, so the stop
+        # can sit just beyond proven price rather than a generic ATR distance.
+        "support_low": min(p for _, p in support),
+        "resistance_high": max(p for _, p in resistance),
         "support_touches": len(support),
         "resistance_touches": len(resistance),
         "trend": classify_trend(bars, atr, config),
@@ -690,18 +699,26 @@ def run_range_detection(state, client, config):
 
 
 def _order_levels(side, rng, config):
-    """Return (direction, entry, stop, target, rr) for a buy or sell setup."""
+    """Return (direction, entry, stop, target, rr) for a buy or sell setup.
+
+    Stop sits just beyond the wick extreme of the swings that formed the level
+    (a tight, structure-based stop), with a small STOP_BUFFER_ATR cushion. Falls
+    back to STOP_ATR_MULT*ATR if wick data isn't present (older saved ranges)."""
     atr = rng["atr"]
     sup = rng["support"]
     res = rng["resistance"]
-    stop_dist = config["stop_atr_mult"] * atr
+    buf = config["stop_buffer_atr"] * atr
     if side == "support":
         direction = "BUY AT SUPPORT"
-        entry, stop, target = sup, sup - stop_dist, res
+        wick = rng.get("support_low")
+        stop = (wick - buf) if wick is not None else sup - config["stop_atr_mult"] * atr
+        entry, target = sup, res
         rr = (target - entry) / (entry - stop) if entry != stop else 0.0
     else:
         direction = "SELL AT RESISTANCE"
-        entry, stop, target = res, res + stop_dist, sup
+        wick = rng.get("resistance_high")
+        stop = (wick + buf) if wick is not None else res + config["stop_atr_mult"] * atr
+        entry, target = res, sup
         rr = (entry - target) / (stop - entry) if stop != entry else 0.0
     return direction, entry, stop, target, rr
 
@@ -1005,12 +1022,12 @@ def run_loop(state, client, config, notifier):
     logger.info("Env vars loaded: TELEGRAM_BOT_TOKEN (set), TELEGRAM_CHAT_ID=%s",
                 config["telegram_chat_id"])
     logger.info("Config: top %d pairs by 24h volume, always include [%s], "
-                "ATR(%d) on %d x 4H bars, zone=%.2fxATR, alert=%.2fxATR, stop=%.2fxATR, "
-                "max width=%.2fxATR/%.1f%%, min touches=%d, trend filter=%s, "
-                "break filter=%s",
+                "ATR(%d) on %d x 4H bars, zone=%.2fxATR, alert=%.2fxATR, "
+                "stop=wick+%.2fxATR, max width=%.2fxATR/%.1f%%, min touches=%d, "
+                "trend filter=%s, break filter=%s",
                 config["top_n"], ", ".join(config["always_include"]) or "none",
                 config["atr_period"], config["range_candles"], config["zone_atr_mult"],
-                config["alert_atr_mult"], config["stop_atr_mult"],
+                config["alert_atr_mult"], config["stop_buffer_atr"],
                 config["max_range_atr_mult"], config["max_range_pct"],
                 config["min_touches"], "on" if config["trend_filter"] else "off",
                 "on" if config["break_filter"] else "off")
