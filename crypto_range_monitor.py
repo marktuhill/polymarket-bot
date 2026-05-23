@@ -17,8 +17,9 @@ What it does
   30 closed 4H candles per pair, computes ATR(14) from scratch, finds swing
   highs/lows, clusters them into support/resistance zones (members within
   +/-0.5*ATR, zone level = mean). A valid range needs >= 2 touches of each zone
-  and a width between 0.5*ATR and MAX_RANGE_ATR_MULT*ATR (default 3), so it
-  stays tight enough to round-trip intraday.
+  and a width between 0.5*ATR and MAX_RANGE_ATR_MULT*ATR (default 3) that is
+  also <= MAX_RANGE_PCT (default 8%) of price, so it stays tight enough to
+  round-trip intraday.
 * Alert check (every 30 min): pulls the last closed 1H candle per pair and fires
   when the 1H close is within 0.25*ATR of a zone boundary. Each zone alerts once
   per approach (de-dup with hysteresis until price leaves and re-approaches).
@@ -44,6 +45,8 @@ Optional (defaults in parentheses):
     STOP_ATR_MULT        (1.0)       stop distance beyond the zone, in ATR
     MAX_RANGE_ATR_MULT   (3.0)       reject ranges wider than this * ATR (keeps
                                      them tight enough to round-trip intraday)
+    MAX_RANGE_PCT        (8.0)       reject ranges wider than this % of price
+                                     (filters hyper-volatile fresh listings)
     MIN_TOUCHES          (2)         min touches required per zone
     BINANCE_BASE_URL     (https://fapi.binance.com)  USDT-M futures API host
 These may also be placed in a ``.env`` file next to this script.
@@ -163,6 +166,7 @@ def get_config():
         "alert_atr_mult": _env_float("ALERT_ATR_MULT", 0.25),
         "stop_atr_mult": _env_float("STOP_ATR_MULT", 1.0),
         "max_range_atr_mult": _env_float("MAX_RANGE_ATR_MULT", 3.0),
+        "max_range_pct": _env_float("MAX_RANGE_PCT", 8.0),
         "min_touches": _env_int("MIN_TOUCHES", 2),
         "binance_base_url": os.environ.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/"),
     }
@@ -480,6 +484,10 @@ def detect_range(symbol, bars, config):
     if width <= 2 * config["alert_atr_mult"] * atr:
         return None
     if width > config["max_range_atr_mult"] * atr:
+        return None
+    # Absolute tightness cap: skip ranges too wide (in %) to round-trip in a day,
+    # e.g. freshly listed coins whose ATR is huge but the box still spans 50%+.
+    if sup_level > 0 and width / sup_level > config["max_range_pct"] / 100.0:
         return None
 
     return {
@@ -844,11 +852,12 @@ def run_loop(state, client, config, notifier):
                 config["telegram_chat_id"])
     logger.info("Config: top %d pairs by 24h volume, always include [%s], "
                 "ATR(%d) on %d x 4H bars, zone=%.2fxATR, alert=%.2fxATR, stop=%.2fxATR, "
-                "max width=%.2fxATR, min touches=%d",
+                "max width=%.2fxATR/%.1f%%, min touches=%d",
                 config["top_n"], ", ".join(config["always_include"]) or "none",
                 config["atr_period"], config["range_candles"], config["zone_atr_mult"],
                 config["alert_atr_mult"], config["stop_atr_mult"],
-                config["max_range_atr_mult"], config["min_touches"])
+                config["max_range_atr_mult"], config["max_range_pct"],
+                config["min_touches"])
     logger.info("Monitoring %d perpetual(s); PAXGUSDT included: %s",
                 len(pairs), "yes" if "PAXGUSDT" in pairs else "no")
     logger.info("Schedule: range detection every 4h (UTC-aligned), "
