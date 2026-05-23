@@ -77,6 +77,9 @@ Command-line flags
               first to sanity-check before deploying.
     --status  Print all currently detected ranges (levels, touches, age) from the
               saved state file and exit. No Telegram, no network.
+    --review  Forward-test logged alerts: for each row in the alert CSV, fetch
+              later 5m price and report whether it filled and hit target or stop
+              first, plus win-rate / expectancy. Read-only (needs Binance).
 
 Deploying on a Linux VPS (survive reboots)
 -----------------------------------------
@@ -200,6 +203,8 @@ def get_config():
         "break_filter": _env_bool("BREAK_FILTER", True),
         "break_atr": _env_float("BREAK_ATR", 0.5),
         "break_lookback": _env_int("BREAK_LOOKBACK", 8),
+        "review_fill_hours": _env_float("REVIEW_FILL_HOURS", 4.0),
+        "review_hold_hours": _env_float("REVIEW_HOLD_HOURS", 36.0),
         "binance_base_url": os.environ.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/"),
         "proxy": os.environ.get("BINANCE_PROXY", "").strip(),
     }
@@ -1032,6 +1037,102 @@ def run_test(state, client, config):
     print("\nTEST complete. No Telegram messages were sent.")
 
 
+def _fetch_klines_from(client, symbol, interval, start_ms, limit):
+    """Raw klines from a start time (forward review only). Returns [] on failure."""
+    data = client._get("/fapi/v1/klines",
+                       params={"symbol": symbol, "interval": interval,
+                               "startTime": start_ms, "limit": limit})
+    return data if isinstance(data, list) else []
+
+
+def review_alerts(client, config):
+    """Forward-test: resolve each logged alert against what price did next.
+
+    For every row in crypto_range_alerts.csv, fetch 5m bars from the alert time
+    and check (1) did the limit entry fill, and (2) did it then hit target or
+    stop first. Prints per-alert outcomes and a performance summary. Read-only.
+    """
+    if not os.path.isfile(ALERTS_CSV):
+        print(f"No alert log yet ({ALERTS_CSV}).")
+        print("Forward results show up here once the live bot has fired alerts.")
+        return
+    try:
+        with open(ALERTS_CSV, "r", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+    except OSError as exc:
+        print(f"Could not read {ALERTS_CSV}: {exc}")
+        return
+    if not rows:
+        print("Alert log is empty - nothing to review yet.")
+        return
+
+    interval, bar_min = "5m", 5
+    fill_bars = max(1, int(config["review_fill_hours"] * 60 / bar_min))
+    hold_bars = max(1, int(config["review_hold_hours"] * 60 / bar_min))
+
+    print(f"Reviewing {len(rows)} alert(s) | fill window {config['review_fill_hours']:.0f}h, "
+          f"max hold {config['review_hold_hours']:.0f}h, {interval} resolution\n")
+    print("-" * 88)
+    print(f"{'TIME (UTC)':<21}{'PAIR':<13}{'DIR':<5}{'ENTRY':>13}{'OUTCOME':>12}{'R':>8}")
+    print("-" * 88)
+
+    n_fill = n_nofill = n_win = n_loss = n_open = n_nodata = 0
+    total_r = 0.0
+    for row in rows:
+        try:
+            ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            pair, direction = row["pair"], row["direction"]
+            entry, stop, target = float(row["entry"]), float(row["stop"]), float(row["target"])
+            rr = float(row["rr"])
+        except (KeyError, ValueError):
+            continue
+        is_buy = "BUY" in direction
+        bars = _fetch_klines_from(client, pair, interval,
+                                  int(ts.timestamp() * 1000), fill_bars + hold_bars + 5)
+        outcome, r = "?", 0.0
+        if not bars:
+            outcome, n_nodata = "no-data", n_nodata + 1
+        else:
+            fill_i = None
+            for i, b in enumerate(bars[:fill_bars]):
+                hi, lo = float(b[2]), float(b[3])
+                if (is_buy and lo <= entry) or (not is_buy and hi >= entry):
+                    fill_i = i
+                    break
+            if fill_i is None:
+                outcome, n_nofill = "no-fill", n_nofill + 1
+            else:
+                n_fill += 1
+                outcome = "open"
+                for b in bars[fill_i:fill_i + hold_bars]:
+                    hi, lo = float(b[2]), float(b[3])
+                    hit_stop = (lo <= stop) if is_buy else (hi >= stop)
+                    hit_tgt = (hi >= target) if is_buy else (lo <= target)
+                    if hit_stop:  # conservative: if both touch in one 5m bar, stop wins
+                        outcome, r, n_loss = "loss", -1.0, n_loss + 1
+                        break
+                    if hit_tgt:
+                        outcome, r, n_win = "win", rr, n_win + 1
+                        break
+                if outcome == "open":
+                    n_open += 1
+                else:
+                    total_r += r
+        rcell = f"{r:+.2f}" if outcome in ("win", "loss") else "-"
+        print(f"{row['timestamp']:<21}{pair:<13}{('BUY' if is_buy else 'SELL'):<5}"
+              f"{entry:>13.6g}{outcome:>12}{rcell:>8}")
+
+    resolved = n_win + n_loss
+    print("-" * 88)
+    print(f"\nAlerts: {len(rows)} | filled: {n_fill} | no-fill: {n_nofill} | no-data: {n_nodata}")
+    if resolved:
+        print(f"Resolved: {resolved} (wins {n_win}, losses {n_loss}) | still open: {n_open}")
+        print(f"Win rate: {100.0 * n_win / resolved:.0f}%  |  total: {total_r:+.2f}R  |  "
+              f"expectancy: {total_r / resolved:+.2f}R per trade")
+    else:
+        print(f"Still open/unresolved: {n_open} - not enough forward data to score yet.")
+
+
 def run_loop(state, client, config, notifier):
     """The continuous scheduler: detection (4h), alerts (30m), refresh (24h)."""
     pairs = refresh_pairs(state, client, config)
@@ -1115,6 +1216,9 @@ def parse_args():
     parser.add_argument("--status", action="store_true",
                         help="Print currently detected ranges from the saved state "
                              "and exit (no Telegram, no network).")
+    parser.add_argument("--review", action="store_true",
+                        help="Forward-test logged alerts (crypto_range_alerts.csv): "
+                             "resolve each against later price and print stats.")
     return parser.parse_args()
 
 
@@ -1133,6 +1237,10 @@ def main():
 
     if args.test:
         run_test(state, client, config)
+        return
+
+    if args.review:
+        review_alerts(client, config)
         return
 
     missing = [name for name, key in (("TELEGRAM_BOT_TOKEN", "telegram_token"),
