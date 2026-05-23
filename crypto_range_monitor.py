@@ -98,7 +98,7 @@ CSV_HEADER = ["timestamp", "pair", "direction", "entry", "stop", "target",
 # Trading pairs whose base asset matches these are skipped (stablecoins).
 STABLE_BASES = {
     "USDC", "BUSD", "TUSD", "FDUSD", "USDP", "DAI", "UST", "USDD",
-    "GUSD", "PAX", "USTC", "EUR", "AEUR", "USD1", "USDe",
+    "GUSD", "PAX", "USTC", "EUR", "AEUR", "USD1", "USDe", "RLUSD",
 }
 
 logger = logging.getLogger("crypto_range_monitor")
