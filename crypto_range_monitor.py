@@ -7,9 +7,9 @@ within a configurable multiple of ATR(14) of the range high or low.
 
 What it does
 ------------
-* Pair universe is built dynamically from Binance: every spot ``*USDT`` pair
-  whose rolling 24h quote volume exceeds ``MIN_QUOTE_VOLUME`` (default $50M).
-  The list is refreshed every 24h.
+* Pair universe is built dynamically from Binance: the top 50 spot ``*USDT``
+  pairs by 24h quote volume (stablecoin pairs excluded), plus PAXGUSDT which is
+  always included regardless of volume. The list is refreshed every 24h.
 * Range detection runs every 4h, aligned to Binance 4H bar close. For each pair
   it pulls closed 4H candles, computes ATR(14) from scratch, and records the
   range high/low over a lookback window.
@@ -27,7 +27,8 @@ Required:
     TELEGRAM_BOT_TOKEN   Telegram bot token (from @BotFather)
     TELEGRAM_CHAT_ID     Chat / channel id to send alerts to
 Optional (defaults in parentheses):
-    MIN_QUOTE_VOLUME     (50000000)  min 24h quote volume in USDT to include a pair
+    TOP_PAIRS            (50)        number of top pairs by 24h quote volume to track
+    ALWAYS_INCLUDE       (PAXGUSDT)  comma-separated symbols always included
     RANGE_LOOKBACK       (20)        number of closed 4H bars defining the range
     ATR_PERIOD           (14)        ATR period
     PROXIMITY_ATR_MULT   (0.5)       alert when within this * ATR of an edge
@@ -124,7 +125,9 @@ def get_config():
     return {
         "telegram_token": os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", "").strip(),
-        "min_quote_volume": _env_float("MIN_QUOTE_VOLUME", 50_000_000),
+        "top_n": _env_int("TOP_PAIRS", 50),
+        "always_include": [s.strip().upper() for s in
+                           os.environ.get("ALWAYS_INCLUDE", "PAXGUSDT").split(",") if s.strip()],
         "range_lookback": _env_int("RANGE_LOOKBACK", 20),
         "atr_period": _env_int("ATR_PERIOD", 14),
         "proximity_atr_mult": _env_float("PROXIMITY_ATR_MULT", 0.5),
@@ -380,37 +383,46 @@ def fmt(value):
 
 
 def refresh_pairs(state, client, config):
-    """Fetch the dynamic pair universe from Binance and store it on state."""
+    """Fetch the dynamic pair universe from Binance and store it on state.
+
+    Universe = the top N spot ``*USDT`` pairs by 24h quote volume with
+    stablecoin pairs removed, plus any ``always_include`` symbols (e.g.
+    PAXGUSDT) regardless of their volume.
+    """
     data = client.get_24hr()
     if not isinstance(data, list):
         logger.warning("Pair refresh failed; keeping %d existing pair(s)",
                        len(state.get("pairs", [])))
         return state.get("pairs", [])
 
-    min_vol = config["min_quote_volume"]
+    available = set()
     candidates = []
     for row in data:
         symbol = row.get("symbol", "")
         if not symbol.endswith("USDT"):
             continue
-        base = symbol[:-4]
-        if base in STABLE_BASES:
-            continue
-        if base.endswith(("UP", "DOWN", "BULL", "BEAR")):  # leveraged tokens
+        available.add(symbol)
+        if symbol[:-4] in STABLE_BASES:  # remove stablecoin pairs only
             continue
         try:
             quote_volume = float(row.get("quoteVolume", 0))
         except (TypeError, ValueError):
             continue
-        if quote_volume >= min_vol:
-            candidates.append((symbol, quote_volume))
+        candidates.append((symbol, quote_volume))
 
     candidates.sort(key=lambda x: x[1], reverse=True)
-    pairs = [sym for sym, _ in candidates]
+    pairs = [sym for sym, _ in candidates[:config["top_n"]]]
+
+    # Force-include configured symbols (e.g. PAXGUSDT) regardless of volume.
+    forced = [sym for sym in config["always_include"]
+              if sym in available and sym not in pairs]
+    pairs.extend(forced)
+
     state["pairs"] = pairs
     state["last_pair_refresh"] = int(time.time())
-    logger.info("Pair universe refreshed: %d pairs with 24h quote volume >= $%s",
-                len(pairs), f"{min_vol:,.0f}")
+    logger.info("Pair universe refreshed: %d pair(s) (top %d by 24h quote volume%s)",
+                len(pairs), config["top_n"],
+                "; forced: " + ", ".join(forced) if forced else "")
     return pairs
 
 
@@ -585,10 +597,11 @@ def main():
     logger.info("Crypto Range Monitor started")
     logger.info("Env vars loaded: TELEGRAM_BOT_TOKEN (set), TELEGRAM_CHAT_ID=%s",
                 config["telegram_chat_id"])
-    logger.info("Config: min_quote_volume=$%s, lookback=%d bars, ATR period=%d, "
-                "proximity=%.2fxATR",
-                f"{config['min_quote_volume']:,.0f}", config["range_lookback"],
-                config["atr_period"], config["proximity_atr_mult"])
+    logger.info("Config: top %d pairs by 24h volume, always include [%s], "
+                "lookback=%d bars, ATR period=%d, proximity=%.2fxATR",
+                config["top_n"], ", ".join(config["always_include"]) or "none",
+                config["range_lookback"], config["atr_period"],
+                config["proximity_atr_mult"])
     logger.info("Monitoring %d USDT pair(s)", len(pairs))
     logger.info("Schedule: range detection every 4h (UTC-aligned), "
                 "alert check every 30m, pair refresh every 24h")
