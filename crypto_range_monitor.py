@@ -23,8 +23,8 @@ What it does
 Dependencies: ``requests`` plus the Python standard library only. No pandas,
 no numpy.
 
-Environment variables (User scope, trader account)
---------------------------------------------------
+Environment variables
+---------------------
 Required (never hardcoded):
     TELEGRAM_BOT_TOKEN   Telegram bot token (from @BotFather)
     TELEGRAM_CHAT_ID     Chat / channel id to send alerts to
@@ -49,16 +49,14 @@ Command-line flags
     --status  Print all currently detected ranges (levels, touches, age) from the
               saved state file and exit. No Telegram, no network.
 
-Running on a Windows VPS (survive reboots)
+Deploying on a Linux VPS (survive reboots)
 -----------------------------------------
-Runs its own scheduling loop forever, so it only needs launching once per boot.
-Windows Task Scheduler, under the ``trader`` account:
-    1. Create Task -> "Run whether user is logged on or not" (trader user)
-    2. Trigger: "At startup"
-    3. Action: Start a program
-         Program/script:  C:\\path\\to\\python.exe
-         Arguments:       C:\\path\\to\\crypto_range_monitor.py
-    4. Settings: "If the task fails, restart every 1 minute" (self-heal).
+Runs its own scheduling loop forever. Quick start from the repo folder:
+    ./setup.sh                  # venv + deps, captures Telegram creds, runs --test
+    sudo ./install_service.sh   # installs+enables a systemd service (auto-restart)
+Manage it with:
+    systemctl status crypto-range-monitor
+    journalctl -u crypto-range-monitor -f
 Logs: crypto_range_monitor.log; fired alerts also append to
 crypto_range_alerts.csv (both in this script's directory).
 """
