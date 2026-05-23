@@ -16,8 +16,10 @@ What it does
 * Range detection (every 4h, aligned to Binance 4H bar close): pulls the last
   30 closed 4H candles per pair, computes ATR(14) from scratch, finds swing
   highs/lows, clusters them into support/resistance zones (members within
-  +/-0.5*ATR, zone level = mean). A valid range needs >= 2 touches of each zone
-  and a width between 0.5*ATR and MAX_RANGE_ATR_MULT*ATR (default 3) that is
+  +/-0.5*ATR, zone level = mean). A valid range needs >= 2 *genuine* touches of
+  each side -- touches only count as separate if price left the zone and came
+  back between them, so a burst of pivots from one visit counts once -- and a
+  width between 0.5*ATR and MAX_RANGE_ATR_MULT*ATR (default 3) that is
   also <= MAX_RANGE_PCT (default 8%) of price, so it stays tight enough to
   round-trip intraday.
 * Alert check (every 30 min): pulls the last closed 1H candle per pair and fires
@@ -481,9 +483,26 @@ def _cluster_mean(cluster):
     return sum(p[1] for p in cluster) / len(cluster)
 
 
-def _cluster_score(cluster):
-    """Rank clusters: more touches first, then more recent (higher max index)."""
-    return (len(cluster), max(idx for idx, _ in cluster))
+def _genuine_touches(cluster, bars, tol, kind):
+    """Count touches where price actually left the zone (by `tol`) and came back
+    between them, so a run of pivots from a single visit counts as one genuine
+    touch. `kind` is 'high' (resistance) or 'low' (support)."""
+    members = sorted(cluster, key=lambda p: p[0])  # by bar index
+    if not members:
+        return 0
+    level = _cluster_mean(cluster)
+    count = 1
+    last_idx = members[0][0]
+    for idx, _ in members[1:]:
+        between = bars[last_idx + 1:idx]
+        if kind == "high":
+            left = any(b[1] < level - tol for b in between)   # dipped off resistance
+        else:
+            left = any(b[0] > level + tol for b in between)   # popped off support
+        if left:
+            count += 1
+            last_idx = idx
+    return count
 
 
 def classify_trend(bars, atr, config):
@@ -517,19 +536,21 @@ def detect_range(symbol, bars, config):
 
     highs = cluster_levels(find_swings(bars, strength, "high"), tol)
     lows = cluster_levels(find_swings(bars, strength, "low"), tol)
-    res_clusters = [c for c in highs if len(c) >= min_touches]
-    sup_clusters = [c for c in lows if len(c) >= min_touches]
+    res_clusters = [c for c in highs if _genuine_touches(c, bars, tol, "high") >= min_touches]
+    sup_clusters = [c for c in lows if _genuine_touches(c, bars, tol, "low") >= min_touches]
     if not res_clusters or not sup_clusters:
         return None
 
-    resistance = max(res_clusters, key=_cluster_score)
+    resistance = max(res_clusters, key=lambda c: (_genuine_touches(c, bars, tol, "high"),
+                                                  max(i for i, _ in c)))
     res_level = _cluster_mean(resistance)
 
     # Support must sit below resistance to form a real range.
     below = [c for c in sup_clusters if _cluster_mean(c) < res_level]
     if not below:
         return None
-    support = max(below, key=_cluster_score)
+    support = max(below, key=lambda c: (_genuine_touches(c, bars, tol, "low"),
+                                        max(i for i, _ in c)))
     sup_level = _cluster_mean(support)
 
     # Zones must be far enough apart that the alert bands stay distinct, but not
@@ -561,8 +582,8 @@ def detect_range(symbol, bars, config):
         # can sit just beyond proven price rather than a generic ATR distance.
         "support_low": min(p for _, p in support),
         "resistance_high": max(p for _, p in resistance),
-        "support_touches": len(support),
-        "resistance_touches": len(resistance),
+        "support_touches": _genuine_touches(support, bars, tol, "low"),
+        "resistance_touches": _genuine_touches(resistance, bars, tol, "high"),
         "trend": classify_trend(bars, atr, config),
         "support_broken": support_broken,
         "resistance_broken": resistance_broken,
