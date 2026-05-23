@@ -49,6 +49,9 @@ Optional (defaults in parentheses):
                                      (filters hyper-volatile fresh listings)
     MIN_TOUCHES          (2)         min touches required per zone
     BINANCE_BASE_URL     (https://fapi.binance.com)  USDT-M futures API host
+    BINANCE_PROXY        ()          optional http(s) proxy for Binance only,
+                                     e.g. http://user:pass@host:port (routes
+                                     around region blocks; Telegram stays direct)
 These may also be placed in a ``.env`` file next to this script.
 
 Command-line flags
@@ -169,6 +172,7 @@ def get_config():
         "max_range_pct": _env_float("MAX_RANGE_PCT", 8.0),
         "min_touches": _env_int("MIN_TOUCHES", 2),
         "binance_base_url": os.environ.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/"),
+        "proxy": os.environ.get("BINANCE_PROXY", "").strip(),
     }
 
 
@@ -201,7 +205,7 @@ def setup_logging():
 class BinanceClient:
     """Thin Binance REST client with exponential backoff and host failover."""
 
-    def __init__(self, base_url):
+    def __init__(self, base_url, proxy=None):
         # USDT-M futures (fapi) has no public mirror set, so use the single
         # configured host and rely on backoff/retry instead of host failover.
         self.hosts = [base_url] if base_url else ["https://fapi.binance.com"]
@@ -212,6 +216,9 @@ class BinanceClient:
         self.max_backoff = 64.0
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "crypto-range-monitor/2.0"})
+        # Route only Binance traffic through the proxy (Telegram stays direct), so
+        # a geo-blocked host can still reach fapi via an allowed-region proxy.
+        self.proxies = {"http": proxy, "https": proxy} if proxy else None
 
     def _rotate_host(self):
         self.host_index = (self.host_index + 1) % len(self.hosts)
@@ -224,7 +231,8 @@ class BinanceClient:
         for attempt in range(1, self.max_retries + 1):
             url = self.hosts[self.host_index] + path
             try:
-                resp = self.session.get(url, params=params, timeout=self.timeout)
+                resp = self.session.get(url, params=params, timeout=self.timeout,
+                                        proxies=self.proxies)
             except requests.RequestException as exc:
                 logger.warning("Network error (%s) on %s [attempt %d/%d]; retry in %.0fs",
                                exc, path, attempt, self.max_retries, backoff)
@@ -846,8 +854,9 @@ def run_loop(state, client, config, notifier):
     pairs = refresh_pairs(state, client, config)
 
     logger.info("=" * 60)
-    logger.info("Crypto Range Monitor started (USDT-M futures: %s)",
-                config["binance_base_url"])
+    logger.info("Crypto Range Monitor started (USDT-M futures: %s%s)",
+                config["binance_base_url"],
+                "; via proxy" if config["proxy"] else "")
     logger.info("Env vars loaded: TELEGRAM_BOT_TOKEN (set), TELEGRAM_CHAT_ID=%s",
                 config["telegram_chat_id"])
     logger.info("Config: top %d pairs by 24h volume, always include [%s], "
@@ -934,7 +943,7 @@ def main():
         print_ranges(load_state())
         return
 
-    client = BinanceClient(config["binance_base_url"])
+    client = BinanceClient(config["binance_base_url"], config["proxy"])
     state = load_state()
 
     if args.test:
