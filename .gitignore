@@ -1,0 +1,7 @@
+.env
+crypto_range_monitor.log
+crypto_range_monitor.log.*
+crypto_range_monitor_state.json
+crypto_range_monitor_state.json.tmp
+__pycache__/
+*.pyc
