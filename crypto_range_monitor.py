@@ -8,7 +8,7 @@ ready-to-use order levels.
 
 What it does
 ------------
-* Pair universe: the top 50 USDT-margined perpetual contracts by 24h quote
+* Pair universe: the top 100 USDT-margined perpetual contracts by 24h quote
   volume with stablecoin pairs removed, plus PAXGUSDT which is always included
   regardless of volume. Refreshed every 24h (along with per-pair tick sizes).
   Note: futures uses 1000x multiplier symbols (e.g. 1000PEPEUSDT), so the levels
@@ -38,7 +38,7 @@ Required (never hardcoded):
     TELEGRAM_BOT_TOKEN   Telegram bot token (from @BotFather)
     TELEGRAM_CHAT_ID     Chat / channel id to send alerts to
 Optional (defaults in parentheses):
-    TOP_PAIRS            (50)        number of top pairs by 24h quote volume
+    TOP_PAIRS            (100)       number of top pairs by 24h quote volume
     ALWAYS_INCLUDE       (PAXGUSDT)  comma-separated symbols always included
     ATR_PERIOD           (14)        ATR period
     RANGE_CANDLES        (30)        number of closed 4H candles to analyse
@@ -176,7 +176,7 @@ def get_config():
     return {
         "telegram_token": os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", "").strip(),
-        "top_n": _env_int("TOP_PAIRS", 50),
+        "top_n": _env_int("TOP_PAIRS", 100),
         "always_include": [s.strip().upper() for s in
                            os.environ.get("ALWAYS_INCLUDE", "PAXGUSDT").split(",") if s.strip()],
         "atr_period": _env_int("ATR_PERIOD", 14),
