@@ -869,6 +869,56 @@ def next_aligned(now_ts, period, offset=0):
 # --------------------------------------------------------------------------- #
 # Run modes
 # --------------------------------------------------------------------------- #
+def _range_status(close, rng, config):
+    """Short human label for where price sits and whether it would alert."""
+    atr = rng["atr"]
+    sup = rng["support"]
+    res = rng["resistance"]
+    prox = config["alert_atr_mult"] * atr
+    trend = rng.get("trend", "flat")
+    tf = config["trend_filter"]
+    if close < sup:
+        return "below support (broken)"
+    if close > res:
+        return "above resist (broken)"
+    if close <= sup + prox:
+        if tf and trend == "down":
+            return "at support (trend block)"
+        return ">> BUY signal"
+    if close >= res - prox:
+        if tf and trend == "up":
+            return "at resist (trend block)"
+        return ">> SELL signal"
+    return "mid-range"
+
+
+def print_range_status(state, client, config):
+    """For each detected range, fetch the latest 1H close and show where price
+    sits relative to the boundaries, so it's clear which setups are close to
+    triggering vs. parked mid-range."""
+    ranges = state.get("ranges", {})
+    ticks = state.get("ticks", {})
+    if not ranges:
+        return
+    print("\n--- Live position vs range (latest 1H close) ---")
+    print("-" * 92)
+    print(f"{'PAIR':<14}{'CLOSE':>14}{'TREND':>7}"
+          f"{'TO SUP(ATR)':>13}{'TO RES(ATR)':>13}{'STATUS':>26}")
+    print("-" * 92)
+    for symbol in sorted(ranges):
+        rng = ranges[symbol]
+        bars = client.get_klines(symbol, "1h", 2)
+        if not bars:
+            continue
+        close = bars[-1][2]
+        atr = rng["atr"]
+        d_sup = (close - rng["support"]) / atr if atr else 0.0   # + above support
+        d_res = (rng["resistance"] - close) / atr if atr else 0.0  # + below resistance
+        print(f"{symbol:<14}{fmt_price(close, symbol, ticks):>14}"
+              f"{rng.get('trend', 'flat'):>7}{d_sup:>13.2f}{d_res:>13.2f}"
+              f"{_range_status(close, rng, config):>26}")
+
+
 def run_test(state, client, config):
     """One full scan cycle printed to the console; sends no Telegram messages."""
     logger.info("TEST MODE: one full scan cycle (no Telegram sends)")
@@ -884,6 +934,7 @@ def run_test(state, client, config):
     n = run_range_detection(state, client, config)
     print(f"\nValid ranges detected: {n}\n")
     print_ranges(state)
+    print_range_status(state, client, config)
 
     print("\n--- Alert scan (latest 1H close vs zones) ---")
     fired = run_alert_check(state, client, config, notifier=None, dry_run=True)
