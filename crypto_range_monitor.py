@@ -14,9 +14,11 @@ What it does
   Note: futures uses 1000x multiplier symbols (e.g. 1000PEPEUSDT), so the levels
   match the exact contract you trade.
 * Range detection (every 4h, aligned to Binance 4H bar close): pulls the last
-  120 closed 4H candles per pair, computes ATR(14) from scratch, finds swing
+  30 closed 4H candles per pair, computes ATR(14) from scratch, finds swing
   highs/lows, clusters them into support/resistance zones (members within
-  +/-0.5*ATR, zone level = mean). A valid range needs >= 2 touches of each zone.
+  +/-0.5*ATR, zone level = mean). A valid range needs >= 2 touches of each zone
+  and a width between 0.5*ATR and MAX_RANGE_ATR_MULT*ATR (default 3), so it
+  stays tight enough to round-trip intraday.
 * Alert check (every 30 min): pulls the last closed 1H candle per pair and fires
   when the 1H close is within 0.25*ATR of a zone boundary. Each zone alerts once
   per approach (de-dup with hysteresis until price leaves and re-approaches).
@@ -35,11 +37,13 @@ Optional (defaults in parentheses):
     TOP_PAIRS            (50)        number of top pairs by 24h quote volume
     ALWAYS_INCLUDE       (PAXGUSDT)  comma-separated symbols always included
     ATR_PERIOD           (14)        ATR period
-    RANGE_CANDLES        (120)       number of closed 4H candles to analyse
+    RANGE_CANDLES        (30)        number of closed 4H candles to analyse
     SWING_STRENGTH       (2)         bars on each side that define a swing point
     ZONE_ATR_MULT        (0.5)       cluster swings within this * ATR into a zone
     ALERT_ATR_MULT       (0.25)      alert when within this * ATR of a boundary
     STOP_ATR_MULT        (1.0)       stop distance beyond the zone, in ATR
+    MAX_RANGE_ATR_MULT   (3.0)       reject ranges wider than this * ATR (keeps
+                                     them tight enough to round-trip intraday)
     MIN_TOUCHES          (2)         min touches required per zone
     BINANCE_BASE_URL     (https://fapi.binance.com)  USDT-M futures API host
 These may also be placed in a ``.env`` file next to this script.
@@ -153,11 +157,12 @@ def get_config():
         "always_include": [s.strip().upper() for s in
                            os.environ.get("ALWAYS_INCLUDE", "PAXGUSDT").split(",") if s.strip()],
         "atr_period": _env_int("ATR_PERIOD", 14),
-        "range_candles": _env_int("RANGE_CANDLES", 120),
+        "range_candles": _env_int("RANGE_CANDLES", 30),
         "swing_strength": _env_int("SWING_STRENGTH", 2),
         "zone_atr_mult": _env_float("ZONE_ATR_MULT", 0.5),
         "alert_atr_mult": _env_float("ALERT_ATR_MULT", 0.25),
         "stop_atr_mult": _env_float("STOP_ATR_MULT", 1.0),
+        "max_range_atr_mult": _env_float("MAX_RANGE_ATR_MULT", 3.0),
         "min_touches": _env_int("MIN_TOUCHES", 2),
         "binance_base_url": os.environ.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/"),
     }
@@ -469,8 +474,12 @@ def detect_range(symbol, bars, config):
     support = max(below, key=_cluster_score)
     sup_level = _cluster_mean(support)
 
-    # Zones must be far enough apart that the alert bands stay distinct.
-    if res_level - sup_level <= 2 * config["alert_atr_mult"] * atr:
+    # Zones must be far enough apart that the alert bands stay distinct, but not
+    # so wide the range can't round-trip intraday (max width capped in ATR).
+    width = res_level - sup_level
+    if width <= 2 * config["alert_atr_mult"] * atr:
+        return None
+    if width > config["max_range_atr_mult"] * atr:
         return None
 
     return {
@@ -835,10 +844,11 @@ def run_loop(state, client, config, notifier):
                 config["telegram_chat_id"])
     logger.info("Config: top %d pairs by 24h volume, always include [%s], "
                 "ATR(%d) on %d x 4H bars, zone=%.2fxATR, alert=%.2fxATR, stop=%.2fxATR, "
-                "min touches=%d",
+                "max width=%.2fxATR, min touches=%d",
                 config["top_n"], ", ".join(config["always_include"]) or "none",
                 config["atr_period"], config["range_candles"], config["zone_atr_mult"],
-                config["alert_atr_mult"], config["stop_atr_mult"], config["min_touches"])
+                config["alert_atr_mult"], config["stop_atr_mult"],
+                config["max_range_atr_mult"], config["min_touches"])
     logger.info("Monitoring %d perpetual(s); PAXGUSDT included: %s",
                 len(pairs), "yes" if "PAXGUSDT" in pairs else "no")
     logger.info("Schedule: range detection every 4h (UTC-aligned), "
