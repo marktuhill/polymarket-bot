@@ -1,66 +1,77 @@
 #!/usr/bin/env python3
 """Crypto range monitor & alert scheduler.
 
-Monitors Binance spot USDT pairs for price action that is *approaching* the edge
-of an established trading range, and sends a Telegram alert when price comes
-within a configurable multiple of ATR(14) of the range high or low.
+Scans Binance spot USDT pairs for established price *ranges* on the 4H timeframe
+(swing-based support/resistance zones) and sends a Telegram alert when the 1H
+close approaches a zone boundary, including ready-to-use order levels.
 
 What it does
 ------------
-* Pair universe is built dynamically from Binance: the top 50 spot ``*USDT``
-  pairs by 24h quote volume (stablecoin pairs excluded), plus PAXGUSDT which is
-  always included regardless of volume. The list is refreshed every 24h.
-* Range detection runs every 4h, aligned to Binance 4H bar close. For each pair
-  it pulls closed 4H candles, computes ATR(14) from scratch, and records the
-  range high/low over a lookback window.
-* Alert checks run every 30 minutes. Current price is compared against each
-  stored range; if price is within ``PROXIMITY_ATR_MULT * ATR`` of an edge (and
-  still inside the range) a Telegram alert fires. Per-edge de-duplication with
-  hysteresis prevents repeat spam until price moves away and comes back.
+* Pair universe: the top 50 spot ``*USDT`` pairs by 24h quote volume with
+  stablecoin pairs removed, plus PAXGUSDT which is always included regardless of
+  volume. Refreshed every 24h (along with per-pair tick sizes).
+* Range detection (every 4h, aligned to Binance 4H bar close): pulls the last
+  120 closed 4H candles per pair, computes ATR(14) from scratch, finds swing
+  highs/lows, clusters them into support/resistance zones (members within
+  +/-0.5*ATR, zone level = mean). A valid range needs >= 2 touches of each zone.
+* Alert check (every 30 min): pulls the last closed 1H candle per pair and fires
+  when the 1H close is within 0.25*ATR of a zone boundary. Each zone alerts once
+  per approach (de-dup with hysteresis until price leaves and re-approaches).
+* Every alert includes exact order levels (entry / stop / target / R:R) printed
+  to the pair's native Binance tick size.
 
 Dependencies: ``requests`` plus the Python standard library only. No pandas,
 no numpy.
 
-Environment variables
----------------------
-Required:
+Environment variables (User scope, trader account)
+--------------------------------------------------
+Required (never hardcoded):
     TELEGRAM_BOT_TOKEN   Telegram bot token (from @BotFather)
     TELEGRAM_CHAT_ID     Chat / channel id to send alerts to
 Optional (defaults in parentheses):
-    TOP_PAIRS            (50)        number of top pairs by 24h quote volume to track
+    TOP_PAIRS            (50)        number of top pairs by 24h quote volume
     ALWAYS_INCLUDE       (PAXGUSDT)  comma-separated symbols always included
-    RANGE_LOOKBACK       (20)        number of closed 4H bars defining the range
     ATR_PERIOD           (14)        ATR period
-    PROXIMITY_ATR_MULT   (0.5)       alert when within this * ATR of an edge
+    RANGE_CANDLES        (120)       number of closed 4H candles to analyse
+    SWING_STRENGTH       (2)         bars on each side that define a swing point
+    ZONE_ATR_MULT        (0.5)       cluster swings within this * ATR into a zone
+    ALERT_ATR_MULT       (0.25)      alert when within this * ATR of a boundary
+    STOP_ATR_MULT        (1.0)       stop distance beyond the zone, in ATR
+    MIN_TOUCHES          (2)         min touches required per zone
     BINANCE_BASE_URL     (https://api.binance.com)  primary API host
 These may also be placed in a ``.env`` file next to this script.
 
+Command-line flags
+------------------
+    --test    Run one full scan cycle, print detected ranges and any alerts to
+              the console, and exit WITHOUT sending Telegram messages. Run this
+              first to sanity-check before deploying.
+    --status  Print all currently detected ranges (levels, touches, age) from the
+              saved state file and exit. No Telegram, no network.
+
 Running on a Windows VPS (survive reboots)
 -----------------------------------------
-The script runs its own internal scheduling loop forever, so it only needs to be
-(re)launched once per boot. Use Windows Task Scheduler:
-    1. Create Task -> Trigger: "At startup"
-    2. Action: Start a program
+Runs its own scheduling loop forever, so it only needs launching once per boot.
+Windows Task Scheduler, under the ``trader`` account:
+    1. Create Task -> "Run whether user is logged on or not" (trader user)
+    2. Trigger: "At startup"
+    3. Action: Start a program
          Program/script:  C:\\path\\to\\python.exe
          Arguments:       C:\\path\\to\\crypto_range_monitor.py
-    3. Settings: "If the task fails, restart every 1 minute" (so it self-heals).
-Logs are written to crypto_range_monitor.log in the same directory as this file.
-
-Verifying credentials
----------------------
-Before leaving it running, do a one-shot check:
-    python crypto_range_monitor.py --test
-This runs a single fetch + detection cycle, sends one confirmation message to
-Telegram, prints PASS/FAIL, and exits (no scheduling loop, no edge alerts).
+    4. Settings: "If the task fails, restart every 1 minute" (self-heal).
+Logs: crypto_range_monitor.log; fired alerts also append to
+crypto_range_alerts.csv (both in this script's directory).
 """
 
 import argparse
+import csv
 import json
 import logging
 import math
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
 import requests
@@ -70,6 +81,7 @@ import requests
 # --------------------------------------------------------------------------- #
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(SCRIPT_DIR, "crypto_range_monitor.log")
+ALERTS_CSV = os.path.join(SCRIPT_DIR, "crypto_range_alerts.csv")
 STATE_FILE = os.path.join(SCRIPT_DIR, "crypto_range_monitor_state.json")
 ENV_FILE = os.path.join(SCRIPT_DIR, ".env")
 
@@ -81,6 +93,9 @@ ALERT_INTERVAL = 30 * 60          # 30 minutes
 PAIR_REFRESH_INTERVAL = 24 * 60 * 60  # 24 hours
 DETECT_DELAY = 30                 # wait this long after bar close before pulling
 MAX_SLEEP = 300                   # never sleep longer than this between wakes
+
+CSV_HEADER = ["timestamp", "pair", "direction", "entry", "stop", "target",
+              "rr", "zone_high", "zone_low", "atr"]
 
 # Trading pairs whose base asset matches these are skipped (stablecoins).
 STABLE_BASES = {
@@ -136,9 +151,13 @@ def get_config():
         "top_n": _env_int("TOP_PAIRS", 50),
         "always_include": [s.strip().upper() for s in
                            os.environ.get("ALWAYS_INCLUDE", "PAXGUSDT").split(",") if s.strip()],
-        "range_lookback": _env_int("RANGE_LOOKBACK", 20),
         "atr_period": _env_int("ATR_PERIOD", 14),
-        "proximity_atr_mult": _env_float("PROXIMITY_ATR_MULT", 0.5),
+        "range_candles": _env_int("RANGE_CANDLES", 120),
+        "swing_strength": _env_int("SWING_STRENGTH", 2),
+        "zone_atr_mult": _env_float("ZONE_ATR_MULT", 0.5),
+        "alert_atr_mult": _env_float("ALERT_ATR_MULT", 0.25),
+        "stop_atr_mult": _env_float("STOP_ATR_MULT", 1.0),
+        "min_touches": _env_int("MIN_TOUCHES", 2),
         "binance_base_url": os.environ.get("BINANCE_BASE_URL", "https://api.binance.com").rstrip("/"),
     }
 
@@ -173,7 +192,6 @@ class BinanceClient:
     """Thin Binance REST client with exponential backoff and host failover."""
 
     def __init__(self, base_url):
-        # Primary host first, then public fallbacks used on persistent failure.
         self.hosts = []
         for host in (base_url, "https://api1.binance.com",
                      "https://api2.binance.com", "https://data-api.binance.vision"):
@@ -185,7 +203,7 @@ class BinanceClient:
         self.initial_backoff = 2.0
         self.max_backoff = 64.0
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "crypto-range-monitor/1.0"})
+        self.session.headers.update({"User-Agent": "crypto-range-monitor/2.0"})
 
     def _rotate_host(self):
         self.host_index = (self.host_index + 1) % len(self.hosts)
@@ -196,8 +214,7 @@ class BinanceClient:
         JSON or None if every retry was exhausted."""
         backoff = self.initial_backoff
         for attempt in range(1, self.max_retries + 1):
-            host = self.hosts[self.host_index]
-            url = host + path
+            url = self.hosts[self.host_index] + path
             try:
                 resp = self.session.get(url, params=params, timeout=self.timeout)
             except requests.RequestException as exc:
@@ -234,7 +251,6 @@ class BinanceClient:
                 backoff = min(backoff * 2, self.max_backoff)
                 continue
 
-            # Other 4xx: not retryable.
             logger.error("HTTP %d on %s: %s", resp.status_code, path, resp.text[:200])
             return None
 
@@ -245,19 +261,11 @@ class BinanceClient:
         """All-symbol 24h ticker stats (list of dicts)."""
         return self._get("/api/v3/ticker/24hr")
 
-    def get_all_prices(self):
-        """Map of {symbol: float price} for every symbol."""
-        data = self._get("/api/v3/ticker/price")
-        prices = {}
-        if isinstance(data, list):
-            for row in data:
-                try:
-                    prices[row["symbol"]] = float(row["price"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-        return prices
+    def get_exchange_info(self):
+        """Full exchange metadata (symbols + filters)."""
+        return self._get("/api/v3/exchangeInfo")
 
-    def get_klines(self, symbol, interval="4h", limit=120):
+    def get_klines(self, symbol, interval, limit):
         """Return a list of (high, low, close) tuples for *closed* candles only.
 
         Binance includes the in-progress candle as the last element, so we
@@ -269,12 +277,9 @@ class BinanceClient:
         bars = []
         for kline in data[:-1]:  # drop the still-forming candle
             try:
-                high = float(kline[2])
-                low = float(kline[3])
-                close = float(kline[4])
+                bars.append((float(kline[2]), float(kline[3]), float(kline[4])))
             except (IndexError, TypeError, ValueError):
                 continue
-            bars.append((high, low, close))
         return bars
 
 
@@ -308,7 +313,6 @@ class TelegramNotifier:
             if resp.status_code == 200:
                 return True
             if resp.status_code == 429:
-                retry_after = 1
                 try:
                     retry_after = resp.json().get("parameters", {}).get("retry_after", backoff)
                 except ValueError:
@@ -320,6 +324,42 @@ class TelegramNotifier:
             return False
         logger.error("Telegram send failed after retries")
         return False
+
+
+# --------------------------------------------------------------------------- #
+# Price formatting (native Binance tick size)
+# --------------------------------------------------------------------------- #
+def decimals_from_tick(tick_str):
+    """Decimal places implied by a tickSize string, e.g. '0.00010000' -> 4."""
+    trimmed = str(tick_str).rstrip("0")
+    if "." in trimmed:
+        return len(trimmed.split(".", 1)[1])
+    return 0
+
+
+def _fmt_generic(value):
+    """Fallback formatting when tick size is unknown."""
+    if value == 0:
+        return "0"
+    if abs(value) >= 1:
+        return f"{value:,.4f}".rstrip("0").rstrip(".")
+    return f"{value:.6g}"
+
+
+def to_tick(price, symbol, ticks):
+    """Round a price to the pair's tick size (no-op if tick unknown)."""
+    info = ticks.get(symbol) if ticks else None
+    if info and info.get("tick", 0) > 0:
+        return round(price / info["tick"]) * info["tick"]
+    return price
+
+
+def fmt_price(price, symbol, ticks):
+    """Format a price to the pair's native tick precision, tick-aligned."""
+    info = ticks.get(symbol) if ticks else None
+    if info:
+        return f"{to_tick(price, symbol, ticks):.{info['dec']}f}"
+    return _fmt_generic(price)
 
 
 # --------------------------------------------------------------------------- #
@@ -353,49 +393,108 @@ def compute_atr(bars, period):
 
 
 # --------------------------------------------------------------------------- #
-# Range detection & alerting
+# Swing detection & zone clustering
 # --------------------------------------------------------------------------- #
-def detect_range(bars, config):
-    """Build a range record from closed bars, or None if not a usable range."""
+def find_swings(bars, strength, kind):
+    """Return [(index, price), ...] of swing highs or lows.
+
+    A swing high at i is a high strictly greater than the `strength` highs on each
+    side; a swing low is strictly lower than the lows on each side."""
+    out = []
+    n = len(bars)
+    for i in range(strength, n - strength):
+        if kind == "high":
+            value = bars[i][0]
+            if (all(value > bars[i - j][0] for j in range(1, strength + 1)) and
+                    all(value > bars[i + j][0] for j in range(1, strength + 1))):
+                out.append((i, value))
+        else:
+            value = bars[i][1]
+            if (all(value < bars[i - j][1] for j in range(1, strength + 1)) and
+                    all(value < bars[i + j][1] for j in range(1, strength + 1))):
+                out.append((i, value))
+    return out
+
+
+def cluster_levels(points, tol):
+    """Greedily group price points whose price is within `tol` of the running
+    cluster mean. Returns a list of clusters (each a list of (index, price))."""
+    if not points:
+        return []
+    ordered = sorted(points, key=lambda p: p[1])
+    clusters = [[ordered[0]]]
+    mean = ordered[0][1]
+    for idx, price in ordered[1:]:
+        if abs(price - mean) <= tol:
+            clusters[-1].append((idx, price))
+            mean = sum(p[1] for p in clusters[-1]) / len(clusters[-1])
+        else:
+            clusters.append([(idx, price)])
+            mean = price
+    return clusters
+
+
+def _cluster_mean(cluster):
+    return sum(p[1] for p in cluster) / len(cluster)
+
+
+def _cluster_score(cluster):
+    """Rank clusters: more touches first, then more recent (higher max index)."""
+    return (len(cluster), max(idx for idx, _ in cluster))
+
+
+def detect_range(symbol, bars, config):
+    """Build a swing-based range record from 4H bars, or None if not valid."""
     atr = compute_atr(bars, config["atr_period"])
-    if atr is None or atr <= 0:
+    if not atr or atr <= 0:
         return None
 
-    lookback = config["range_lookback"]
-    if len(bars) < lookback:
+    strength = config["swing_strength"]
+    tol = config["zone_atr_mult"] * atr
+    min_touches = config["min_touches"]
+
+    highs = cluster_levels(find_swings(bars, strength, "high"), tol)
+    lows = cluster_levels(find_swings(bars, strength, "low"), tol)
+    res_clusters = [c for c in highs if len(c) >= min_touches]
+    sup_clusters = [c for c in lows if len(c) >= min_touches]
+    if not res_clusters or not sup_clusters:
         return None
 
-    window = bars[-lookback:]
-    high = max(b[0] for b in window)
-    low = min(b[1] for b in window)
-    width = high - low
-    threshold = config["proximity_atr_mult"] * atr
+    resistance = max(res_clusters, key=_cluster_score)
+    res_level = _cluster_mean(resistance)
 
-    # Range must be wide enough that the high-zone and low-zone don't overlap,
-    # otherwise "approaching" is meaningless.
-    if width <= 2 * threshold:
+    # Support must sit below resistance to form a real range.
+    below = [c for c in sup_clusters if _cluster_mean(c) < res_level]
+    if not below:
+        return None
+    support = max(below, key=_cluster_score)
+    sup_level = _cluster_mean(support)
+
+    # Zones must be far enough apart that the alert bands stay distinct.
+    if res_level - sup_level <= 2 * config["alert_atr_mult"] * atr:
         return None
 
-    return {"high": high, "low": low, "atr": atr,
-            "detected_at": int(time.time()),
-            "alerted_high": False, "alerted_low": False}
+    return {
+        "pair": symbol,
+        "support": sup_level,
+        "resistance": res_level,
+        "atr": atr,
+        "support_touches": len(support),
+        "resistance_touches": len(resistance),
+        "detected_at": int(time.time()),
+        "alerted_support": False,
+        "alerted_resistance": False,
+    }
 
 
-def fmt(value):
-    """Human-friendly number formatting across very different magnitudes."""
-    if value == 0:
-        return "0"
-    if abs(value) >= 1:
-        return f"{value:,.4f}".rstrip("0").rstrip(".")
-    return f"{value:.6g}"
-
-
+# --------------------------------------------------------------------------- #
+# Pair universe
+# --------------------------------------------------------------------------- #
 def refresh_pairs(state, client, config):
-    """Fetch the dynamic pair universe from Binance and store it on state.
+    """Refresh the pair universe and per-pair tick sizes.
 
-    Universe = the top N spot ``*USDT`` pairs by 24h quote volume with
-    stablecoin pairs removed, plus any ``always_include`` symbols (e.g.
-    PAXGUSDT) regardless of their volume.
+    Universe = top N spot ``*USDT`` pairs by 24h quote volume with stablecoin
+    pairs removed, plus any ``always_include`` symbols regardless of volume.
     """
     data = client.get_24hr()
     if not isinstance(data, list):
@@ -421,142 +520,223 @@ def refresh_pairs(state, client, config):
     candidates.sort(key=lambda x: x[1], reverse=True)
     pairs = [sym for sym, _ in candidates[:config["top_n"]]]
 
-    # Force-include configured symbols (e.g. PAXGUSDT) regardless of volume.
     forced = [sym for sym in config["always_include"]
               if sym in available and sym not in pairs]
     pairs.extend(forced)
 
     state["pairs"] = pairs
     state["last_pair_refresh"] = int(time.time())
+    _refresh_ticks(state, client, pairs)
     logger.info("Pair universe refreshed: %d pair(s) (top %d by 24h quote volume%s)",
                 len(pairs), config["top_n"],
                 "; forced: " + ", ".join(forced) if forced else "")
     return pairs
 
 
+def _refresh_ticks(state, client, pairs):
+    """Fetch tick sizes for the monitored pairs from exchangeInfo."""
+    info = client.get_exchange_info()
+    if not isinstance(info, dict):
+        logger.warning("Could not refresh tick sizes; keeping existing")
+        return
+    wanted = set(pairs)
+    ticks = {}
+    for sym_info in info.get("symbols", []):
+        symbol = sym_info.get("symbol")
+        if symbol not in wanted:
+            continue
+        for flt in sym_info.get("filters", []):
+            if flt.get("filterType") == "PRICE_FILTER":
+                tick = flt.get("tickSize", "0")
+                ticks[symbol] = {"tick": float(tick), "dec": decimals_from_tick(tick)}
+                break
+    if ticks:
+        state["ticks"] = ticks
+
+
+# --------------------------------------------------------------------------- #
+# Detection & alerting
+# --------------------------------------------------------------------------- #
 def run_range_detection(state, client, config):
-    """Recompute ranges for all monitored pairs (every 4h)."""
+    """Recompute swing-based ranges for all monitored pairs (every 4h)."""
     if not state.get("pairs"):
         refresh_pairs(state, client, config)
 
     pairs = state.get("pairs", [])
-    logger.info("Range detection starting for %d pair(s)", len(pairs))
     ranges = state.setdefault("ranges", {})
+    logger.info("Range detection starting for %d pair(s)", len(pairs))
     detected = 0
 
     for symbol in pairs:
-        bars = client.get_klines(symbol, interval="4h",
-                                 limit=max(config["range_lookback"], config["atr_period"]) + 5)
-        if not bars:
+        bars = client.get_klines(symbol, "4h", config["range_candles"])
+        if not bars or len(bars) < config["atr_period"] + 1:
+            ranges.pop(symbol, None)
             continue
-        new_range = detect_range(bars, config)
+        new_range = detect_range(symbol, bars, config)
         if new_range is None:
-            ranges.pop(symbol, None)  # no longer a valid range
+            ranges.pop(symbol, None)
             continue
 
-        # Preserve de-dup flags if the range edges barely moved, so a pair that
-        # is parked at an edge doesn't re-alert every 4h.
+        # Preserve de-dup flags when the zones barely moved, so a pair parked at
+        # a boundary doesn't re-alert every 4h.
         old = ranges.get(symbol)
         if old:
             tol = 0.1 * new_range["atr"]
-            if abs(new_range["high"] - old["high"]) < tol and abs(new_range["low"] - old["low"]) < tol:
-                new_range["alerted_high"] = old.get("alerted_high", False)
-                new_range["alerted_low"] = old.get("alerted_low", False)
+            if (abs(new_range["resistance"] - old["resistance"]) < tol and
+                    abs(new_range["support"] - old["support"]) < tol):
+                new_range["alerted_support"] = old.get("alerted_support", False)
+                new_range["alerted_resistance"] = old.get("alerted_resistance", False)
         ranges[symbol] = new_range
         detected += 1
 
-    # Drop ranges for pairs that left the universe.
     for stale in [s for s in ranges if s not in pairs]:
         ranges.pop(stale, None)
 
-    logger.info("Range detection complete: %d active range(s)", detected)
+    logger.info("Range detection complete: %d valid range(s)", detected)
+    return detected
 
 
-def run_alert_check(state, client, config, notifier):
-    """Compare current prices against stored ranges and alert near edges (30m)."""
+def _order_levels(side, rng, config):
+    """Return (direction, entry, stop, target, rr) for a buy or sell setup."""
+    atr = rng["atr"]
+    sup = rng["support"]
+    res = rng["resistance"]
+    stop_dist = config["stop_atr_mult"] * atr
+    if side == "support":
+        direction = "BUY AT SUPPORT"
+        entry, stop, target = sup, sup - stop_dist, res
+        rr = (target - entry) / (entry - stop) if entry != stop else 0.0
+    else:
+        direction = "SELL AT RESISTANCE"
+        entry, stop, target = res, res + stop_dist, sup
+        rr = (entry - target) / (stop - entry) if stop != entry else 0.0
+    return direction, entry, stop, target, rr
+
+
+def build_alert_message(symbol, side, rng, current, config, ticks):
+    direction, entry, stop, target, rr = _order_levels(side, rng, config)
+
+    def disp(price):
+        return fmt_price(price, symbol, ticks)
+
+    divider = "─" * 21  # box-drawing horizontal line
+    when = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return "\n".join([
+        f"\U0001F514 RANGE ALERT — {symbol}",
+        f"Direction: {direction}",
+        divider,
+        f"Zone High:  {disp(rng['resistance'])}",
+        f"Zone Low:   {disp(rng['support'])}",
+        f"Current:    {disp(current)}",
+        divider,
+        f"ENTRY:      {disp(entry)}",
+        f"STOP:       {disp(stop)}",
+        f"TARGET:     {disp(target)}",
+        f"R:R:        1:{rr:.2f}",
+        divider,
+        f"ATR(14):    {disp(rng['atr'])}",
+        f"Touches:    {rng['support_touches']}/{rng['resistance_touches']}",
+        f"Time:       {when}",
+    ])
+
+
+def _record_alert_csv(symbol, side, rng, config, ticks):
+    direction, entry, stop, target, rr = _order_levels(side, rng, config)
+
+    def disp(price):
+        return fmt_price(price, symbol, ticks)
+
+    row = [
+        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        symbol, direction, disp(entry), disp(stop), disp(target),
+        f"{rr:.2f}", disp(rng["resistance"]), disp(rng["support"]), disp(rng["atr"]),
+    ]
+    try:
+        new_file = not os.path.isfile(ALERTS_CSV)
+        with open(ALERTS_CSV, "a", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            if new_file:
+                writer.writerow(CSV_HEADER)
+            writer.writerow(row)
+    except OSError as exc:
+        logger.warning("Could not write alert CSV: %s", exc)
+
+
+def _emit_alert(symbol, side, rng, current, config, ticks, notifier, dry_run):
+    message = build_alert_message(symbol, side, rng, current, config, ticks)
+    direction = "BUY AT SUPPORT" if side == "support" else "SELL AT RESISTANCE"
+    logger.info("ALERT %s %s (1H close=%s)", symbol, direction, fmt_price(current, symbol, ticks))
+    if dry_run:
+        print("\n[TEST] Would send Telegram alert:\n" + message)
+        return
+    if notifier.send(message):
+        _record_alert_csv(symbol, side, rng, config, ticks)
+
+
+def run_alert_check(state, client, config, notifier, dry_run=False):
+    """Compare the latest 1H close to each zone and alert near boundaries (30m)."""
     ranges = state.get("ranges", {})
+    ticks = state.get("ticks", {})
     if not ranges:
-        logger.info("Alert check: no active ranges yet")
-        return
-
-    prices = client.get_all_prices()
-    if not prices:
-        logger.warning("Alert check skipped: could not fetch prices")
-        return
+        logger.info("Alert check: no active ranges")
+        return 0
 
     checked = 0
     fired = 0
     for symbol, rng in ranges.items():
-        price = prices.get(symbol)
-        if price is None:
+        bars = client.get_klines(symbol, "1h", 2)
+        if not bars:
             continue
+        close = bars[-1][2]  # latest closed 1H close
         checked += 1
-        high = rng["high"]
-        low = rng["low"]
         atr = rng["atr"]
-        threshold = config["proximity_atr_mult"] * atr
+        proximity = config["alert_atr_mult"] * atr
+        sup = rng["support"]
+        res = rng["resistance"]
 
-        dist_high = high - price
-        dist_low = price - low
-
-        # Approaching the high from inside the range.
-        if 0 <= dist_high <= threshold:
-            if not rng.get("alerted_high"):
-                _send_edge_alert(notifier, symbol, "HIGH", price, rng, threshold)
-                rng["alerted_high"] = True
+        # Approaching support -> buy setup.
+        if abs(close - sup) <= proximity:
+            if not rng.get("alerted_support"):
+                _emit_alert(symbol, "support", rng, close, config, ticks, notifier, dry_run)
+                rng["alerted_support"] = True
                 fired += 1
-        elif dist_high > 1.5 * threshold:  # hysteresis reset
-            rng["alerted_high"] = False
+        elif abs(close - sup) > 1.5 * proximity:
+            rng["alerted_support"] = False
 
-        # Approaching the low from inside the range.
-        if 0 <= dist_low <= threshold:
-            if not rng.get("alerted_low"):
-                _send_edge_alert(notifier, symbol, "LOW", price, rng, threshold)
-                rng["alerted_low"] = True
+        # Approaching resistance -> sell setup.
+        if abs(close - res) <= proximity:
+            if not rng.get("alerted_resistance"):
+                _emit_alert(symbol, "resistance", rng, close, config, ticks, notifier, dry_run)
+                rng["alerted_resistance"] = True
                 fired += 1
-        elif dist_low > 1.5 * threshold:  # hysteresis reset
-            rng["alerted_low"] = False
+        elif abs(close - res) > 1.5 * proximity:
+            rng["alerted_resistance"] = False
 
-    logger.info("Alert check complete: %d pair(s) checked, %d alert(s) sent", checked, fired)
-
-
-def _send_edge_alert(notifier, symbol, edge, price, rng, threshold):
-    high, low, atr = rng["high"], rng["low"], rng["atr"]
-    edge_price = high if edge == "HIGH" else low
-    distance = abs(edge_price - price)
-    pct = (distance / price * 100) if price else 0.0
-    mult = (distance / atr) if atr else 0.0
-    text = (
-        f"{symbol} approaching range {edge}\n"
-        f"Price: {fmt(price)}\n"
-        f"Range {edge.lower()}: {fmt(edge_price)}\n"
-        f"Range: {fmt(low)} - {fmt(high)}\n"
-        f"Distance: {fmt(distance)} ({pct:.2f}% / {mult:.2f}xATR)\n"
-        f"ATR(14): {fmt(atr)}"
-    )
-    logger.info("ALERT %s approaching %s (price=%s edge=%s dist=%.4f xATR=%.2f)",
-                symbol, edge, fmt(price), fmt(edge_price), distance, mult)
-    notifier.send(text)
+    logger.info("Alert check complete: %d pair(s) checked, %d alert(s)", checked, fired)
+    return fired
 
 
 # --------------------------------------------------------------------------- #
-# State persistence (survive reboots)
+# State persistence (survive reboots; also feeds --status)
 # --------------------------------------------------------------------------- #
+def _empty_state():
+    return {"pairs": [], "ranges": {}, "ticks": {}, "last_pair_refresh": 0}
+
+
 def load_state():
     if not os.path.isfile(STATE_FILE):
-        return {"pairs": [], "ranges": {}, "last_pair_refresh": 0}
+        return _empty_state()
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as fh:
             state = json.load(fh)
-        state.setdefault("pairs", [])
-        state.setdefault("ranges", {})
-        state.setdefault("last_pair_refresh", 0)
+        for key, default in _empty_state().items():
+            state.setdefault(key, default)
         logger.info("Loaded state: %d pair(s), %d active range(s)",
                     len(state["pairs"]), len(state["ranges"]))
         return state
     except (OSError, ValueError) as exc:
         logger.warning("Could not load state (%s); starting fresh", exc)
-        return {"pairs": [], "ranges": {}, "last_pair_refresh": 0}
+        return _empty_state()
 
 
 def save_state(state):
@@ -570,6 +750,30 @@ def save_state(state):
 
 
 # --------------------------------------------------------------------------- #
+# Console reporting (--status / --test)
+# --------------------------------------------------------------------------- #
+def print_ranges(state):
+    ranges = state.get("ranges", {})
+    ticks = state.get("ticks", {})
+    if not ranges:
+        print("No ranges currently detected.")
+        return
+    now = time.time()
+    print(f"Detected ranges: {len(ranges)}")
+    print("-" * 76)
+    print(f"{'PAIR':<14}{'SUPPORT':>15}{'RESISTANCE':>15}{'TOUCHES S/R':>14}{'AGE(h)':>10}")
+    print("-" * 76)
+    for symbol in sorted(ranges):
+        rng = ranges[symbol]
+        age = (now - rng.get("detected_at", now)) / 3600.0
+        touches = f"{rng['support_touches']}/{rng['resistance_touches']}"
+        print(f"{symbol:<14}"
+              f"{fmt_price(rng['support'], symbol, ticks):>15}"
+              f"{fmt_price(rng['resistance'], symbol, ticks):>15}"
+              f"{touches:>14}{age:>10.1f}")
+
+
+# --------------------------------------------------------------------------- #
 # Scheduling helpers
 # --------------------------------------------------------------------------- #
 def next_aligned(now_ts, period, offset=0):
@@ -579,77 +783,33 @@ def next_aligned(now_ts, period, offset=0):
 
 
 # --------------------------------------------------------------------------- #
-# One-shot credential / connectivity test
+# Run modes
 # --------------------------------------------------------------------------- #
-def run_test(state, client, config, notifier):
-    """Single cycle: fetch pairs, run detection, send one Telegram message, exit.
-
-    Confirms both Binance reachability and Telegram credentials before the bot
-    is left running unattended. Does not run edge-alert checks (so it won't fire
-    real alerts) and does not enter the scheduling loop. Returns True on a
-    successful Telegram send.
-    """
-    logger.info("TEST MODE: one fetch + detection cycle, then exit")
+def run_test(state, client, config):
+    """One full scan cycle printed to the console; sends no Telegram messages."""
+    logger.info("TEST MODE: one full scan cycle (no Telegram sends)")
     client.max_retries = 2  # fail fast for quick feedback
 
     pairs = refresh_pairs(state, client, config)
-    binance_ok = bool(pairs)
-    run_range_detection(state, client, config)
-    n_ranges = len(state.get("ranges", {}))
+    print(f"\nPairs fetched: {len(pairs)} | "
+          f"PAXGUSDT included: {'yes' if 'PAXGUSDT' in pairs else 'no'}")
+    if not pairs:
+        print("Could not fetch pairs from Binance (check network/region). Aborting test.")
+        return
 
-    text = "\n".join([
-        "Crypto Range Monitor - TEST",
-        "Telegram credentials: OK (you are reading this).",
-        f"Binance reachable: {'yes' if binance_ok else 'NO - check network/region'}",
-        f"Pairs monitored: {len(pairs)}",
-        f"Active ranges detected: {n_ranges}",
-    ])
-    ok = notifier.send(text)
-    save_state(state)
+    n = run_range_detection(state, client, config)
+    print(f"\nValid ranges detected: {n}\n")
+    print_ranges(state)
 
-    if ok:
-        logger.info("TEST PASSED: Telegram message sent. Binance reachable=%s, "
-                    "pairs=%d, ranges=%d", binance_ok, len(pairs), n_ranges)
-    else:
-        logger.error("TEST FAILED: could not send Telegram message - check "
-                     "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
-    return ok
+    print("\n--- Alert scan (latest 1H close vs zones) ---")
+    fired = run_alert_check(state, client, config, notifier=None, dry_run=True)
+    if not fired:
+        print("No alerts would fire at current prices.")
+    print("\nTEST complete. No Telegram messages were sent.")
 
 
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Monitor Binance USDT pairs and alert on range-edge approaches.")
-    parser.add_argument(
-        "--test", "--once", action="store_true", dest="test",
-        help="Run one fetch + detection cycle, send a test Telegram message, then exit.")
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-    setup_logging()
-    load_env_file(ENV_FILE)
-    config = get_config()
-
-    missing = [name for name, key in (("TELEGRAM_BOT_TOKEN", "telegram_token"),
-                                      ("TELEGRAM_CHAT_ID", "telegram_chat_id"))
-               if not config[key]]
-    if missing:
-        logger.error("Missing required environment variable(s): %s", ", ".join(missing))
-        logger.error("Set them in the environment or in %s and restart.", ENV_FILE)
-        sys.exit(1)
-
-    client = BinanceClient(config["binance_base_url"])
-    notifier = TelegramNotifier(config["telegram_token"], config["telegram_chat_id"])
-    state = load_state()
-
-    if args.test:
-        sys.exit(0 if run_test(state, client, config, notifier) else 1)
-
-    # Initial pair fetch so we can print a meaningful startup message.
+def run_loop(state, client, config, notifier):
+    """The continuous scheduler: detection (4h), alerts (30m), refresh (24h)."""
     pairs = refresh_pairs(state, client, config)
 
     logger.info("=" * 60)
@@ -657,16 +817,17 @@ def main():
     logger.info("Env vars loaded: TELEGRAM_BOT_TOKEN (set), TELEGRAM_CHAT_ID=%s",
                 config["telegram_chat_id"])
     logger.info("Config: top %d pairs by 24h volume, always include [%s], "
-                "lookback=%d bars, ATR period=%d, proximity=%.2fxATR",
+                "ATR(%d) on %d x 4H bars, zone=%.2fxATR, alert=%.2fxATR, stop=%.2fxATR, "
+                "min touches=%d",
                 config["top_n"], ", ".join(config["always_include"]) or "none",
-                config["range_lookback"], config["atr_period"],
-                config["proximity_atr_mult"])
-    logger.info("Monitoring %d USDT pair(s)", len(pairs))
+                config["atr_period"], config["range_candles"], config["zone_atr_mult"],
+                config["alert_atr_mult"], config["stop_atr_mult"], config["min_touches"])
+    logger.info("Monitoring %d USDT pair(s); PAXGUSDT included: %s",
+                len(pairs), "yes" if "PAXGUSDT" in pairs else "no")
     logger.info("Schedule: range detection every 4h (UTC-aligned), "
                 "alert check every 30m, pair refresh every 24h")
     logger.info("=" * 60)
 
-    # Run an initial cycle immediately so the bot is useful right away.
     try:
         run_range_detection(state, client, config)
         run_alert_check(state, client, config, notifier)
@@ -678,7 +839,6 @@ def main():
     next_detect = next_aligned(now, RANGE_INTERVAL) + DETECT_DELAY
     next_alert = next_aligned(now, ALERT_INTERVAL)
     next_refresh = next_aligned(now, PAIR_REFRESH_INTERVAL)
-
     logger.info("Next range detection in %.0f min; next alert check in %.0f min",
                 (next_detect - now) / 60, (next_alert - now) / 60)
 
@@ -711,6 +871,50 @@ def main():
         except Exception as exc:  # noqa: BLE001 - keep the loop alive on any error
             logger.exception("Unexpected error in main loop: %s; continuing", exc)
             time.sleep(30)
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Monitor Binance USDT pairs and alert on range-boundary approaches.")
+    parser.add_argument("--test", "--once", action="store_true", dest="test",
+                        help="Run one full scan cycle, print ranges and alerts to "
+                             "the console, and exit (no Telegram messages).")
+    parser.add_argument("--status", action="store_true",
+                        help="Print currently detected ranges from the saved state "
+                             "and exit (no Telegram, no network).")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    setup_logging()
+    load_env_file(ENV_FILE)
+    config = get_config()
+
+    if args.status:
+        print_ranges(load_state())
+        return
+
+    client = BinanceClient(config["binance_base_url"])
+    state = load_state()
+
+    if args.test:
+        run_test(state, client, config)
+        return
+
+    missing = [name for name, key in (("TELEGRAM_BOT_TOKEN", "telegram_token"),
+                                      ("TELEGRAM_CHAT_ID", "telegram_chat_id"))
+               if not config[key]]
+    if missing:
+        logger.error("Missing required environment variable(s): %s", ", ".join(missing))
+        logger.error("Set them in the environment or in %s and restart.", ENV_FILE)
+        sys.exit(1)
+
+    notifier = TelegramNotifier(config["telegram_token"], config["telegram_chat_id"])
+    run_loop(state, client, config, notifier)
 
 
 if __name__ == "__main__":
