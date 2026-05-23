@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Crypto range monitor & alert scheduler.
 
-Scans Binance spot USDT pairs for established price *ranges* on the 4H timeframe
-(swing-based support/resistance zones) and sends a Telegram alert when the 1H
-close approaches a zone boundary, including ready-to-use order levels.
+Scans Binance USDT-M perpetual futures (``*USDT`` perps) for established price
+*ranges* on the 4H timeframe (swing-based support/resistance zones) and sends a
+Telegram alert when the 1H close approaches a zone boundary, including
+ready-to-use order levels.
 
 What it does
 ------------
-* Pair universe: the top 50 spot ``*USDT`` pairs by 24h quote volume with
-  stablecoin pairs removed, plus PAXGUSDT which is always included regardless of
-  volume. Refreshed every 24h (along with per-pair tick sizes).
+* Pair universe: the top 50 USDT-margined perpetual contracts by 24h quote
+  volume with stablecoin pairs removed, plus PAXGUSDT which is always included
+  regardless of volume. Refreshed every 24h (along with per-pair tick sizes).
+  Note: futures uses 1000x multiplier symbols (e.g. 1000PEPEUSDT), so the levels
+  match the exact contract you trade.
 * Range detection (every 4h, aligned to Binance 4H bar close): pulls the last
   120 closed 4H candles per pair, computes ATR(14) from scratch, finds swing
   highs/lows, clusters them into support/resistance zones (members within
@@ -38,7 +41,7 @@ Optional (defaults in parentheses):
     ALERT_ATR_MULT       (0.25)      alert when within this * ATR of a boundary
     STOP_ATR_MULT        (1.0)       stop distance beyond the zone, in ATR
     MIN_TOUCHES          (2)         min touches required per zone
-    BINANCE_BASE_URL     (https://api.binance.com)  primary API host
+    BINANCE_BASE_URL     (https://fapi.binance.com)  USDT-M futures API host
 These may also be placed in a ``.env`` file next to this script.
 
 Command-line flags
@@ -156,7 +159,7 @@ def get_config():
         "alert_atr_mult": _env_float("ALERT_ATR_MULT", 0.25),
         "stop_atr_mult": _env_float("STOP_ATR_MULT", 1.0),
         "min_touches": _env_int("MIN_TOUCHES", 2),
-        "binance_base_url": os.environ.get("BINANCE_BASE_URL", "https://api.binance.com").rstrip("/"),
+        "binance_base_url": os.environ.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/"),
     }
 
 
@@ -190,11 +193,9 @@ class BinanceClient:
     """Thin Binance REST client with exponential backoff and host failover."""
 
     def __init__(self, base_url):
-        self.hosts = []
-        for host in (base_url, "https://api1.binance.com",
-                     "https://api2.binance.com", "https://data-api.binance.vision"):
-            if host and host not in self.hosts:
-                self.hosts.append(host)
+        # USDT-M futures (fapi) has no public mirror set, so use the single
+        # configured host and rely on backoff/retry instead of host failover.
+        self.hosts = [base_url] if base_url else ["https://fapi.binance.com"]
         self.host_index = 0
         self.timeout = 15
         self.max_retries = 6
@@ -257,18 +258,18 @@ class BinanceClient:
 
     def get_24hr(self):
         """All-symbol 24h ticker stats (list of dicts)."""
-        return self._get("/api/v3/ticker/24hr")
+        return self._get("/fapi/v1/ticker/24hr")
 
     def get_exchange_info(self):
         """Full exchange metadata (symbols + filters)."""
-        return self._get("/api/v3/exchangeInfo")
+        return self._get("/fapi/v1/exchangeInfo")
 
     def get_klines(self, symbol, interval, limit):
         """Return a list of (high, low, close) tuples for *closed* candles only.
 
         Binance includes the in-progress candle as the last element, so we
         request one extra and drop it."""
-        data = self._get("/api/v3/klines",
+        data = self._get("/fapi/v1/klines",
                          params={"symbol": symbol, "interval": interval, "limit": limit + 1})
         if not isinstance(data, list) or len(data) < 2:
             return None
@@ -488,11 +489,41 @@ def detect_range(symbol, bars, config):
 # --------------------------------------------------------------------------- #
 # Pair universe
 # --------------------------------------------------------------------------- #
+def _futures_perp_universe(client):
+    """Return {symbol: {tick, dec}} for tradable USDT-margined perpetuals.
+
+    Built from futures ``exchangeInfo`` so the universe excludes delivery
+    (quarterly) contracts, halted symbols, and non-USDT-margined perps, and so
+    entry/stop/target round to each contract's real tick size. Returns ``{}``
+    if exchangeInfo is unavailable (caller falls back gracefully)."""
+    info = client.get_exchange_info()
+    if not isinstance(info, dict):
+        logger.warning("Could not load futures exchangeInfo; "
+                       "universe filter and tick sizes unavailable this cycle")
+        return {}
+    universe = {}
+    for sym_info in info.get("symbols", []):
+        if sym_info.get("quoteAsset") != "USDT":
+            continue
+        if sym_info.get("status") != "TRADING":
+            continue
+        if sym_info.get("contractType") != "PERPETUAL":
+            continue
+        symbol = sym_info.get("symbol")
+        for flt in sym_info.get("filters", []):
+            if flt.get("filterType") == "PRICE_FILTER":
+                tick = flt.get("tickSize", "0")
+                universe[symbol] = {"tick": float(tick), "dec": decimals_from_tick(tick)}
+                break
+    return universe
+
+
 def refresh_pairs(state, client, config):
     """Refresh the pair universe and per-pair tick sizes.
 
-    Universe = top N spot ``*USDT`` pairs by 24h quote volume with stablecoin
-    pairs removed, plus any ``always_include`` symbols regardless of volume.
+    Universe = top N USDT-margined perpetual contracts by 24h quote volume with
+    stablecoin pairs removed, plus any ``always_include`` symbols regardless of
+    volume.
     """
     data = client.get_24hr()
     if not isinstance(data, list):
@@ -500,11 +531,18 @@ def refresh_pairs(state, client, config):
                        len(state.get("pairs", [])))
         return state.get("pairs", [])
 
+    perp_ticks = _futures_perp_universe(client)
+
     available = set()
     candidates = []
     for row in data:
         symbol = row.get("symbol", "")
         if not symbol.endswith("USDT"):
+            continue
+        # Restrict to live perpetuals when we have the universe; otherwise the
+        # endswith check alone still excludes delivery contracts (they carry an
+        # underscore, e.g. BTCUSDT_240927).
+        if perp_ticks and symbol not in perp_ticks:
             continue
         available.add(symbol)
         if symbol[:-4] in STABLE_BASES:  # remove stablecoin pairs only
@@ -524,32 +562,12 @@ def refresh_pairs(state, client, config):
 
     state["pairs"] = pairs
     state["last_pair_refresh"] = int(time.time())
-    _refresh_ticks(state, client, pairs)
-    logger.info("Pair universe refreshed: %d pair(s) (top %d by 24h quote volume%s)",
+    if perp_ticks:
+        state["ticks"] = {sym: perp_ticks[sym] for sym in pairs if sym in perp_ticks}
+    logger.info("Pair universe refreshed: %d perpetual(s) (top %d by 24h quote volume%s)",
                 len(pairs), config["top_n"],
                 "; forced: " + ", ".join(forced) if forced else "")
     return pairs
-
-
-def _refresh_ticks(state, client, pairs):
-    """Fetch tick sizes for the monitored pairs from exchangeInfo."""
-    info = client.get_exchange_info()
-    if not isinstance(info, dict):
-        logger.warning("Could not refresh tick sizes; keeping existing")
-        return
-    wanted = set(pairs)
-    ticks = {}
-    for sym_info in info.get("symbols", []):
-        symbol = sym_info.get("symbol")
-        if symbol not in wanted:
-            continue
-        for flt in sym_info.get("filters", []):
-            if flt.get("filterType") == "PRICE_FILTER":
-                tick = flt.get("tickSize", "0")
-                ticks[symbol] = {"tick": float(tick), "dec": decimals_from_tick(tick)}
-                break
-    if ticks:
-        state["ticks"] = ticks
 
 
 # --------------------------------------------------------------------------- #
@@ -811,7 +829,8 @@ def run_loop(state, client, config, notifier):
     pairs = refresh_pairs(state, client, config)
 
     logger.info("=" * 60)
-    logger.info("Crypto Range Monitor started")
+    logger.info("Crypto Range Monitor started (USDT-M futures: %s)",
+                config["binance_base_url"])
     logger.info("Env vars loaded: TELEGRAM_BOT_TOKEN (set), TELEGRAM_CHAT_ID=%s",
                 config["telegram_chat_id"])
     logger.info("Config: top %d pairs by 24h volume, always include [%s], "
@@ -820,7 +839,7 @@ def run_loop(state, client, config, notifier):
                 config["top_n"], ", ".join(config["always_include"]) or "none",
                 config["atr_period"], config["range_candles"], config["zone_atr_mult"],
                 config["alert_atr_mult"], config["stop_atr_mult"], config["min_touches"])
-    logger.info("Monitoring %d USDT pair(s); PAXGUSDT included: %s",
+    logger.info("Monitoring %d perpetual(s); PAXGUSDT included: %s",
                 len(pairs), "yes" if "PAXGUSDT" in pairs else "no")
     logger.info("Schedule: range detection every 4h (UTC-aligned), "
                 "alert check every 30m, pair refresh every 24h")
