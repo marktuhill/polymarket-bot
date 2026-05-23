@@ -843,17 +843,18 @@ def print_ranges(state):
         return
     now = time.time()
     print(f"Detected ranges: {len(ranges)}")
-    print("-" * 76)
-    print(f"{'PAIR':<14}{'SUPPORT':>15}{'RESISTANCE':>15}{'TOUCHES S/R':>14}{'AGE(h)':>10}")
-    print("-" * 76)
+    print("-" * 84)
+    print(f"{'PAIR':<14}{'SUPPORT':>15}{'RESISTANCE':>15}{'TOUCHES S/R':>14}{'TREND':>8}{'AGE(h)':>10}")
+    print("-" * 84)
     for symbol in sorted(ranges):
         rng = ranges[symbol]
         age = (now - rng.get("detected_at", now)) / 3600.0
         touches = f"{rng['support_touches']}/{rng['resistance_touches']}"
+        trend = rng.get("trend", "flat")
         print(f"{symbol:<14}"
               f"{fmt_price(rng['support'], symbol, ticks):>15}"
               f"{fmt_price(rng['resistance'], symbol, ticks):>15}"
-              f"{touches:>14}{age:>10.1f}")
+              f"{touches:>14}{trend:>8}{age:>10.1f}")
 
 
 # --------------------------------------------------------------------------- #
