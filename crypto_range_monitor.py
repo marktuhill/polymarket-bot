@@ -3,8 +3,8 @@
 
 Scans Binance USDT-M perpetual futures (``*USDT`` perps) for established price
 *ranges* on the 4H timeframe (swing-based support/resistance zones) and sends a
-Telegram alert when the 1H close approaches a zone boundary, including
-ready-to-use order levels.
+Telegram alert when a lower-timeframe close (default 15m) approaches a zone
+boundary, including ready-to-use order levels.
 
 What it does
 ------------
@@ -22,7 +22,8 @@ What it does
   width between 0.5*ATR and MAX_RANGE_ATR_MULT*ATR (default 3) that is
   also <= MAX_RANGE_PCT (default 8%) of price, so it stays tight enough to
   round-trip intraday.
-* Alert check (every 30 min): pulls the last closed 1H candle per pair and fires
+* Alert check (every ALERT_INTERVAL_MIN min, default 10): pulls the last closed
+  ALERT_TIMEFRAME candle (default 15m) per pair and fires
   a buy only when the close sits just above support (a bounce, not a breakdown)
   and a sell only just below resistance, while skipping counter-trend setups
   (TREND_FILTER) and levels a recent 4H bar closed decisively beyond, i.e. a
@@ -64,6 +65,9 @@ Optional (defaults in parentheses):
                                      decisively beyond (a reclaim, not a bounce)
     BREAK_ATR            (0.5)       a close > this * ATR beyond a level = break
     BREAK_LOOKBACK       (8)         how many recent 4H bars to scan for a break
+    ALERT_TIMEFRAME      (15m)       candle close used as the alert trigger
+                                     (1m/3m/5m/15m/30m/1h; lower = faster, noisier)
+    ALERT_INTERVAL_MIN   (10)        minutes between alert checks
     BINANCE_BASE_URL     (https://fapi.binance.com)  USDT-M futures API host
     BINANCE_PROXY        ()          optional http(s) proxy for Binance only,
                                      e.g. http://user:pass@host:port (routes
@@ -119,10 +123,9 @@ ENV_FILE = os.path.join(SCRIPT_DIR, ".env")
 # Scheduling constants (seconds)
 # --------------------------------------------------------------------------- #
 RANGE_INTERVAL = 4 * 60 * 60      # 4h, aligned to UTC (== Binance 4H bar close)
-ALERT_INTERVAL = 30 * 60          # 30 minutes
 PAIR_REFRESH_INTERVAL = 24 * 60 * 60  # 24 hours
 DETECT_DELAY = 30                 # wait this long after bar close before pulling
-MAX_SLEEP = 300                   # never sleep longer than this between wakes
+MAX_SLEEP = 120                   # never sleep longer than this between wakes
 
 CSV_HEADER = ["timestamp", "pair", "direction", "entry", "stop", "target",
               "rr", "zone_high", "zone_low", "atr"]
@@ -181,6 +184,17 @@ def _env_bool(name, default):
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
+_VALID_TIMEFRAMES = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"}
+
+
+def _env_timeframe(name, default):
+    tf = os.environ.get(name, default).strip()
+    if tf not in _VALID_TIMEFRAMES:
+        logger.warning("Invalid %s=%r, using %s", name, tf, default)
+        return default
+    return tf
+
+
 def get_config():
     return {
         "telegram_token": os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
@@ -205,6 +219,8 @@ def get_config():
         "break_lookback": _env_int("BREAK_LOOKBACK", 8),
         "review_fill_hours": _env_float("REVIEW_FILL_HOURS", 4.0),
         "review_hold_hours": _env_float("REVIEW_HOLD_HOURS", 36.0),
+        "alert_timeframe": _env_timeframe("ALERT_TIMEFRAME", "15m"),
+        "alert_interval_min": _env_int("ALERT_INTERVAL_MIN", 10),
         "binance_base_url": os.environ.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/"),
         "proxy": os.environ.get("BINANCE_PROXY", "").strip(),
     }
@@ -801,7 +817,7 @@ def _record_alert_csv(symbol, side, rng, config, ticks):
 def _emit_alert(symbol, side, rng, current, config, ticks, notifier, dry_run):
     message = build_alert_message(symbol, side, rng, current, config, ticks)
     direction = "BUY AT SUPPORT" if side == "support" else "SELL AT RESISTANCE"
-    logger.info("ALERT %s %s (1H close=%s)", symbol, direction, fmt_price(current, symbol, ticks))
+    logger.info("ALERT %s %s (close=%s)", symbol, direction, fmt_price(current, symbol, ticks))
     if dry_run:
         print("\n[TEST] Would send Telegram alert:\n" + message)
         return
@@ -830,7 +846,8 @@ def evaluate_alert(close, rng, config):
 
 
 def run_alert_check(state, client, config, notifier, dry_run=False):
-    """Compare the latest 1H close to each zone and alert near boundaries (30m)."""
+    """Compare the latest trigger-timeframe close to each zone and alert near
+    boundaries (runs every ALERT_INTERVAL_MIN minutes)."""
     ranges = state.get("ranges", {})
     ticks = state.get("ticks", {})
     if not ranges:
@@ -839,11 +856,12 @@ def run_alert_check(state, client, config, notifier, dry_run=False):
 
     checked = 0
     fired = 0
+    tf = config["alert_timeframe"]
     for symbol, rng in ranges.items():
-        bars = client.get_klines(symbol, "1h", 2)
+        bars = client.get_klines(symbol, tf, 2)
         if not bars:
             continue
-        close = bars[-1][2]  # latest closed 1H close
+        close = bars[-1][2]  # latest closed trigger-timeframe close
         checked += 1
         proximity = config["alert_atr_mult"] * rng["atr"]
         sup = rng["support"]
@@ -983,14 +1001,15 @@ def print_range_status(state, client, config):
     signals = []
     if not ranges:
         return signals
-    print("\n--- Live position vs range (latest 1H close) ---")
+    tf = config["alert_timeframe"]
+    print(f"\n--- Live position vs range (latest {tf} close) ---")
     print("-" * 92)
     print(f"{'PAIR':<14}{'CLOSE':>14}{'TREND':>7}"
           f"{'TO SUP(ATR)':>13}{'TO RES(ATR)':>13}{'STATUS':>26}")
     print("-" * 92)
     for symbol in sorted(ranges):
         rng = ranges[symbol]
-        bars = client.get_klines(symbol, "1h", 2)
+        bars = client.get_klines(symbol, tf, 2)
         if not bars:
             continue
         close = bars[-1][2]
@@ -1134,8 +1153,9 @@ def review_alerts(client, config):
 
 
 def run_loop(state, client, config, notifier):
-    """The continuous scheduler: detection (4h), alerts (30m), refresh (24h)."""
+    """The continuous scheduler: detection (4h), alerts, refresh (24h)."""
     pairs = refresh_pairs(state, client, config)
+    alert_interval = max(60, config["alert_interval_min"] * 60)
 
     logger.info("=" * 60)
     logger.info("Crypto Range Monitor started (USDT-M futures: %s%s)",
@@ -1156,7 +1176,8 @@ def run_loop(state, client, config, notifier):
     logger.info("Monitoring %d perpetual(s); PAXGUSDT included: %s",
                 len(pairs), "yes" if "PAXGUSDT" in pairs else "no")
     logger.info("Schedule: range detection every 4h (UTC-aligned), "
-                "alert check every 30m, pair refresh every 24h")
+                "alert check every %dm on %s closes, pair refresh every 24h",
+                config["alert_interval_min"], config["alert_timeframe"])
     logger.info("=" * 60)
 
     try:
@@ -1168,7 +1189,7 @@ def run_loop(state, client, config, notifier):
 
     now = time.time()
     next_detect = next_aligned(now, RANGE_INTERVAL) + DETECT_DELAY
-    next_alert = next_aligned(now, ALERT_INTERVAL)
+    next_alert = next_aligned(now, alert_interval)
     next_refresh = next_aligned(now, PAIR_REFRESH_INTERVAL)
     logger.info("Next range detection in %.0f min; next alert check in %.0f min",
                 (next_detect - now) / 60, (next_alert - now) / 60)
@@ -1190,7 +1211,7 @@ def run_loop(state, client, config, notifier):
             if now >= next_alert:
                 run_alert_check(state, client, config, notifier)
                 save_state(state)
-                next_alert = next_aligned(time.time(), ALERT_INTERVAL)
+                next_alert = next_aligned(time.time(), alert_interval)
 
             sleep_for = max(1.0, min(next_detect, next_alert, next_refresh) - time.time())
             time.sleep(min(sleep_for, MAX_SLEEP))
