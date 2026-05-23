@@ -45,8 +45,16 @@ The script runs its own internal scheduling loop forever, so it only needs to be
          Arguments:       C:\\path\\to\\crypto_range_monitor.py
     3. Settings: "If the task fails, restart every 1 minute" (so it self-heals).
 Logs are written to crypto_range_monitor.log in the same directory as this file.
+
+Verifying credentials
+---------------------
+Before leaving it running, do a one-shot check:
+    python crypto_range_monitor.py --test
+This runs a single fetch + detection cycle, sends one confirmation message to
+Telegram, prints PASS/FAIL, and exits (no scheduling loop, no edge alerts).
 """
 
+import argparse
 import json
 import logging
 import math
@@ -571,9 +579,57 @@ def next_aligned(now_ts, period, offset=0):
 
 
 # --------------------------------------------------------------------------- #
+# One-shot credential / connectivity test
+# --------------------------------------------------------------------------- #
+def run_test(state, client, config, notifier):
+    """Single cycle: fetch pairs, run detection, send one Telegram message, exit.
+
+    Confirms both Binance reachability and Telegram credentials before the bot
+    is left running unattended. Does not run edge-alert checks (so it won't fire
+    real alerts) and does not enter the scheduling loop. Returns True on a
+    successful Telegram send.
+    """
+    logger.info("TEST MODE: one fetch + detection cycle, then exit")
+    client.max_retries = 2  # fail fast for quick feedback
+
+    pairs = refresh_pairs(state, client, config)
+    binance_ok = bool(pairs)
+    run_range_detection(state, client, config)
+    n_ranges = len(state.get("ranges", {}))
+
+    text = "\n".join([
+        "Crypto Range Monitor - TEST",
+        "Telegram credentials: OK (you are reading this).",
+        f"Binance reachable: {'yes' if binance_ok else 'NO - check network/region'}",
+        f"Pairs monitored: {len(pairs)}",
+        f"Active ranges detected: {n_ranges}",
+    ])
+    ok = notifier.send(text)
+    save_state(state)
+
+    if ok:
+        logger.info("TEST PASSED: Telegram message sent. Binance reachable=%s, "
+                    "pairs=%d, ranges=%d", binance_ok, len(pairs), n_ranges)
+    else:
+        logger.error("TEST FAILED: could not send Telegram message - check "
+                     "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+    return ok
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Monitor Binance USDT pairs and alert on range-edge approaches.")
+    parser.add_argument(
+        "--test", "--once", action="store_true", dest="test",
+        help="Run one fetch + detection cycle, send a test Telegram message, then exit.")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     setup_logging()
     load_env_file(ENV_FILE)
     config = get_config()
@@ -589,6 +645,9 @@ def main():
     client = BinanceClient(config["binance_base_url"])
     notifier = TelegramNotifier(config["telegram_token"], config["telegram_chat_id"])
     state = load_state()
+
+    if args.test:
+        sys.exit(0 if run_test(state, client, config, notifier) else 1)
 
     # Initial pair fetch so we can print a meaningful startup message.
     pairs = refresh_pairs(state, client, config)
