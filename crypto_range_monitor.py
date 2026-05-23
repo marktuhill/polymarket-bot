@@ -749,6 +749,23 @@ def _emit_alert(symbol, side, rng, current, config, ticks, notifier, dry_run):
         _record_alert_csv(symbol, side, rng, config, ticks)
 
 
+def evaluate_alert(close, rng, config):
+    """The single source of truth for firing: return 'support' (buy),
+    'resistance' (sell), or None for a given 1H close, applying the proximity
+    band, bounce-only direction, and trend filter."""
+    atr = rng["atr"]
+    prox = config["alert_atr_mult"] * atr
+    sup = rng["support"]
+    res = rng["resistance"]
+    trend = rng.get("trend", "flat")
+    tf = config["trend_filter"]
+    if sup <= close <= sup + prox and not (tf and trend == "down"):
+        return "support"
+    if res - prox <= close <= res and not (tf and trend == "up"):
+        return "resistance"
+    return None
+
+
 def run_alert_check(state, client, config, notifier, dry_run=False):
     """Compare the latest 1H close to each zone and alert near boundaries (30m)."""
     ranges = state.get("ranges", {})
@@ -765,19 +782,13 @@ def run_alert_check(state, client, config, notifier, dry_run=False):
             continue
         close = bars[-1][2]  # latest closed 1H close
         checked += 1
-        atr = rng["atr"]
-        proximity = config["alert_atr_mult"] * atr
+        proximity = config["alert_atr_mult"] * rng["atr"]
         sup = rng["support"]
         res = rng["resistance"]
-        trend = rng.get("trend", "flat")
-        # Trade with the range, not against the trend: skip longs in a downtrend
-        # and shorts in an uptrend (disable via TREND_FILTER=false).
-        block_long = config["trend_filter"] and trend == "down"
-        block_short = config["trend_filter"] and trend == "up"
+        side = evaluate_alert(close, rng, config)
 
-        # Bounce off support: price must be AT or ABOVE support (not breaking
-        # below it) and within the band -> buy setup.
-        if sup <= close <= sup + proximity and not block_long:
+        # Bounce off support -> buy. Re-arm only once price leaves the band.
+        if side == "support":
             if not rng.get("alerted_support"):
                 _emit_alert(symbol, "support", rng, close, config, ticks, notifier, dry_run)
                 rng["alerted_support"] = True
@@ -785,9 +796,8 @@ def run_alert_check(state, client, config, notifier, dry_run=False):
         elif abs(close - sup) > 1.5 * proximity:
             rng["alerted_support"] = False
 
-        # Rejection at resistance: price must be AT or BELOW resistance (not
-        # breaking above it) and within the band -> sell setup.
-        if res - proximity <= close <= res and not block_short:
+        # Rejection at resistance -> sell.
+        if side == "resistance":
             if not rng.get("alerted_resistance"):
                 _emit_alert(symbol, "resistance", rng, close, config, ticks, notifier, dry_run)
                 rng["alerted_resistance"] = True
@@ -881,14 +891,16 @@ def _range_status(close, rng, config):
         return "below support (broken)"
     if close > res:
         return "above resist (broken)"
-    if close <= sup + prox:
-        if tf and trend == "down":
-            return "at support (trend block)"
+    # Defer the fire/no-fire decision to the same rule the live bot uses.
+    side = evaluate_alert(close, rng, config)
+    if side == "support":
         return ">> BUY signal"
-    if close >= res - prox:
-        if tf and trend == "up":
-            return "at resist (trend block)"
+    if side == "resistance":
         return ">> SELL signal"
+    if close <= sup + prox and tf and trend == "down":
+        return "at support (trend block)"
+    if close >= res - prox and tf and trend == "up":
+        return "at resist (trend block)"
     return "mid-range"
 
 
@@ -898,8 +910,9 @@ def print_range_status(state, client, config):
     triggering vs. parked mid-range."""
     ranges = state.get("ranges", {})
     ticks = state.get("ticks", {})
+    signals = []
     if not ranges:
-        return
+        return signals
     print("\n--- Live position vs range (latest 1H close) ---")
     print("-" * 92)
     print(f"{'PAIR':<14}{'CLOSE':>14}{'TREND':>7}"
@@ -917,6 +930,10 @@ def print_range_status(state, client, config):
         print(f"{symbol:<14}{fmt_price(close, symbol, ticks):>14}"
               f"{rng.get('trend', 'flat'):>7}{d_sup:>13.2f}{d_res:>13.2f}"
               f"{_range_status(close, rng, config):>26}")
+        side = evaluate_alert(close, rng, config)
+        if side:
+            signals.append((symbol, side, close))
+    return signals
 
 
 def run_test(state, client, config):
@@ -934,12 +951,19 @@ def run_test(state, client, config):
     n = run_range_detection(state, client, config)
     print(f"\nValid ranges detected: {n}\n")
     print_ranges(state)
-    print_range_status(state, client, config)
 
-    print("\n--- Alert scan (latest 1H close vs zones) ---")
-    fired = run_alert_check(state, client, config, notifier=None, dry_run=True)
-    if not fired:
-        print("No alerts would fire at current prices.")
+    # One fetch pass: the position view and the alerts below come from the same
+    # 1H closes, so a ">> signal" row always matches what would fire.
+    signals = print_range_status(state, client, config)
+
+    print("\n--- Alerts that would fire now ---")
+    if not signals:
+        print("None at current prices.")
+    else:
+        ticks = state.get("ticks", {})
+        for symbol, side, close in signals:
+            _emit_alert(symbol, side, state["ranges"][symbol], close, config,
+                        ticks, notifier=None, dry_run=True)
     print("\nTEST complete. No Telegram messages were sent.")
 
 
