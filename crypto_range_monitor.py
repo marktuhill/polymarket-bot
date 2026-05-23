@@ -23,9 +23,9 @@ What it does
 * Alert check (every 30 min): pulls the last closed 1H candle per pair and fires
   a buy only when the close sits just above support (a bounce, not a breakdown)
   and a sell only just below resistance, while skipping counter-trend setups
-  (no longs in a downtrend / shorts in an uptrend; see TREND_FILTER). Each zone
-  alerts once per approach (de-dup with hysteresis until price leaves and
-  re-approaches).
+  (TREND_FILTER) and levels a recent 4H bar closed decisively beyond, i.e. a
+  reclaim of a broken level (BREAK_FILTER). Each zone alerts once per approach
+  (de-dup with hysteresis until price leaves and re-approaches).
 * Every alert includes exact order levels (entry / stop / target / R:R) printed
   to the pair's native Binance tick size.
 
@@ -54,6 +54,10 @@ Optional (defaults in parentheses):
     TREND_FILTER         (true)      only long in up/flat trends and short in
                                      down/flat (skip counter-trend setups)
     TREND_FLAT_ATR       (1.0)       window drift > this * ATR counts as a trend
+    BREAK_FILTER         (true)      skip a boundary that a recent 4H bar closed
+                                     decisively beyond (a reclaim, not a bounce)
+    BREAK_ATR            (0.5)       a close > this * ATR beyond a level = break
+    BREAK_LOOKBACK       (8)         how many recent 4H bars to scan for a break
     BINANCE_BASE_URL     (https://fapi.binance.com)  USDT-M futures API host
     BINANCE_PROXY        ()          optional http(s) proxy for Binance only,
                                      e.g. http://user:pass@host:port (routes
@@ -186,6 +190,9 @@ def get_config():
         "min_touches": _env_int("MIN_TOUCHES", 2),
         "trend_filter": _env_bool("TREND_FILTER", True),
         "trend_flat_atr": _env_float("TREND_FLAT_ATR", 1.0),
+        "break_filter": _env_bool("BREAK_FILTER", True),
+        "break_atr": _env_float("BREAK_ATR", 0.5),
+        "break_lookback": _env_int("BREAK_LOOKBACK", 8),
         "binance_base_url": os.environ.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/"),
         "proxy": os.environ.get("BINANCE_PROXY", "").strip(),
     }
@@ -532,6 +539,14 @@ def detect_range(symbol, bars, config):
     if sup_level > 0 and width / sup_level > config["max_range_pct"] / 100.0:
         return None
 
+    # Recent-break flags: did a recent 4H bar CLOSE decisively beyond a boundary?
+    # If so the level was broken and is now being retested (a reclaim), not a
+    # clean bounce -- the alert filter uses these to suppress such setups.
+    recent = bars[-max(1, config["break_lookback"]):]
+    break_band = config["break_atr"] * atr
+    support_broken = any(b[2] < sup_level - break_band for b in recent)
+    resistance_broken = any(b[2] > res_level + break_band for b in recent)
+
     return {
         "pair": symbol,
         "support": sup_level,
@@ -540,6 +555,8 @@ def detect_range(symbol, bars, config):
         "support_touches": len(support),
         "resistance_touches": len(resistance),
         "trend": classify_trend(bars, atr, config),
+        "support_broken": support_broken,
+        "resistance_broken": resistance_broken,
         "detected_at": int(time.time()),
         "alerted_support": False,
         "alerted_resistance": False,
@@ -759,9 +776,12 @@ def evaluate_alert(close, rng, config):
     res = rng["resistance"]
     trend = rng.get("trend", "flat")
     tf = config["trend_filter"]
-    if sup <= close <= sup + prox and not (tf and trend == "down"):
+    bf = config["break_filter"]
+    if (sup <= close <= sup + prox and not (tf and trend == "down")
+            and not (bf and rng.get("support_broken"))):
         return "support"
-    if res - prox <= close <= res and not (tf and trend == "up"):
+    if (res - prox <= close <= res and not (tf and trend == "up")
+            and not (bf and rng.get("resistance_broken"))):
         return "resistance"
     return None
 
@@ -897,10 +917,17 @@ def _range_status(close, rng, config):
         return ">> BUY signal"
     if side == "resistance":
         return ">> SELL signal"
-    if close <= sup + prox and tf and trend == "down":
-        return "at support (trend block)"
-    if close >= res - prox and tf and trend == "up":
-        return "at resist (trend block)"
+    bf = config["break_filter"]
+    if close <= sup + prox:
+        if tf and trend == "down":
+            return "at support (trend block)"
+        if bf and rng.get("support_broken"):
+            return "at support (recent break)"
+    if close >= res - prox:
+        if tf and trend == "up":
+            return "at resist (trend block)"
+        if bf and rng.get("resistance_broken"):
+            return "at resist (recent break)"
     return "mid-range"
 
 
@@ -979,12 +1006,14 @@ def run_loop(state, client, config, notifier):
                 config["telegram_chat_id"])
     logger.info("Config: top %d pairs by 24h volume, always include [%s], "
                 "ATR(%d) on %d x 4H bars, zone=%.2fxATR, alert=%.2fxATR, stop=%.2fxATR, "
-                "max width=%.2fxATR/%.1f%%, min touches=%d, trend filter=%s",
+                "max width=%.2fxATR/%.1f%%, min touches=%d, trend filter=%s, "
+                "break filter=%s",
                 config["top_n"], ", ".join(config["always_include"]) or "none",
                 config["atr_period"], config["range_candles"], config["zone_atr_mult"],
                 config["alert_atr_mult"], config["stop_atr_mult"],
                 config["max_range_atr_mult"], config["max_range_pct"],
-                config["min_touches"], "on" if config["trend_filter"] else "off")
+                config["min_touches"], "on" if config["trend_filter"] else "off",
+                "on" if config["break_filter"] else "off")
     logger.info("Monitoring %d perpetual(s); PAXGUSDT included: %s",
                 len(pairs), "yes" if "PAXGUSDT" in pairs else "no")
     logger.info("Schedule: range detection every 4h (UTC-aligned), "
