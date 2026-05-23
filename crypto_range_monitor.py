@@ -21,8 +21,11 @@ What it does
   also <= MAX_RANGE_PCT (default 8%) of price, so it stays tight enough to
   round-trip intraday.
 * Alert check (every 30 min): pulls the last closed 1H candle per pair and fires
-  when the 1H close is within 0.25*ATR of a zone boundary. Each zone alerts once
-  per approach (de-dup with hysteresis until price leaves and re-approaches).
+  a buy only when the close sits just above support (a bounce, not a breakdown)
+  and a sell only just below resistance, while skipping counter-trend setups
+  (no longs in a downtrend / shorts in an uptrend; see TREND_FILTER). Each zone
+  alerts once per approach (de-dup with hysteresis until price leaves and
+  re-approaches).
 * Every alert includes exact order levels (entry / stop / target / R:R) printed
   to the pair's native Binance tick size.
 
@@ -48,6 +51,9 @@ Optional (defaults in parentheses):
     MAX_RANGE_PCT        (8.0)       reject ranges wider than this % of price
                                      (filters hyper-volatile fresh listings)
     MIN_TOUCHES          (2)         min touches required per zone
+    TREND_FILTER         (true)      only long in up/flat trends and short in
+                                     down/flat (skip counter-trend setups)
+    TREND_FLAT_ATR       (1.0)       window drift > this * ATR counts as a trend
     BINANCE_BASE_URL     (https://fapi.binance.com)  USDT-M futures API host
     BINANCE_PROXY        ()          optional http(s) proxy for Binance only,
                                      e.g. http://user:pass@host:port (routes
@@ -155,6 +161,13 @@ def _env_int(name, default):
         return int(default)
 
 
+def _env_bool(name, default):
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
 def get_config():
     return {
         "telegram_token": os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
@@ -171,6 +184,8 @@ def get_config():
         "max_range_atr_mult": _env_float("MAX_RANGE_ATR_MULT", 3.0),
         "max_range_pct": _env_float("MAX_RANGE_PCT", 8.0),
         "min_touches": _env_int("MIN_TOUCHES", 2),
+        "trend_filter": _env_bool("TREND_FILTER", True),
+        "trend_flat_atr": _env_float("TREND_FLAT_ATR", 1.0),
         "binance_base_url": os.environ.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/"),
         "proxy": os.environ.get("BINANCE_PROXY", "").strip(),
     }
@@ -459,6 +474,25 @@ def _cluster_score(cluster):
     return (len(cluster), max(idx for idx, _ in cluster))
 
 
+def classify_trend(bars, atr, config):
+    """Label the window 'up'/'down'/'flat' by comparing the oldest third of
+    closes to the newest third. A drift bigger than TREND_FLAT_ATR*ATR counts as
+    a trend; otherwise it's a flat (genuine range)."""
+    closes = [b[2] for b in bars]
+    n = len(closes)
+    if n < 6 or atr <= 0:
+        return "flat"
+    k = max(1, n // 3)
+    early = sum(closes[:k]) / k
+    late = sum(closes[-k:]) / k
+    band = config["trend_flat_atr"] * atr
+    if late - early > band:
+        return "up"
+    if late - early < -band:
+        return "down"
+    return "flat"
+
+
 def detect_range(symbol, bars, config):
     """Build a swing-based range record from 4H bars, or None if not valid."""
     atr = compute_atr(bars, config["atr_period"])
@@ -505,6 +539,7 @@ def detect_range(symbol, bars, config):
         "atr": atr,
         "support_touches": len(support),
         "resistance_touches": len(resistance),
+        "trend": classify_trend(bars, atr, config),
         "detected_at": int(time.time()),
         "alerted_support": False,
         "alerted_resistance": False,
@@ -734,9 +769,15 @@ def run_alert_check(state, client, config, notifier, dry_run=False):
         proximity = config["alert_atr_mult"] * atr
         sup = rng["support"]
         res = rng["resistance"]
+        trend = rng.get("trend", "flat")
+        # Trade with the range, not against the trend: skip longs in a downtrend
+        # and shorts in an uptrend (disable via TREND_FILTER=false).
+        block_long = config["trend_filter"] and trend == "down"
+        block_short = config["trend_filter"] and trend == "up"
 
-        # Approaching support -> buy setup.
-        if abs(close - sup) <= proximity:
+        # Bounce off support: price must be AT or ABOVE support (not breaking
+        # below it) and within the band -> buy setup.
+        if sup <= close <= sup + proximity and not block_long:
             if not rng.get("alerted_support"):
                 _emit_alert(symbol, "support", rng, close, config, ticks, notifier, dry_run)
                 rng["alerted_support"] = True
@@ -744,8 +785,9 @@ def run_alert_check(state, client, config, notifier, dry_run=False):
         elif abs(close - sup) > 1.5 * proximity:
             rng["alerted_support"] = False
 
-        # Approaching resistance -> sell setup.
-        if abs(close - res) <= proximity:
+        # Rejection at resistance: price must be AT or BELOW resistance (not
+        # breaking above it) and within the band -> sell setup.
+        if res - proximity <= close <= res and not block_short:
             if not rng.get("alerted_resistance"):
                 _emit_alert(symbol, "resistance", rng, close, config, ticks, notifier, dry_run)
                 rng["alerted_resistance"] = True
@@ -861,12 +903,12 @@ def run_loop(state, client, config, notifier):
                 config["telegram_chat_id"])
     logger.info("Config: top %d pairs by 24h volume, always include [%s], "
                 "ATR(%d) on %d x 4H bars, zone=%.2fxATR, alert=%.2fxATR, stop=%.2fxATR, "
-                "max width=%.2fxATR/%.1f%%, min touches=%d",
+                "max width=%.2fxATR/%.1f%%, min touches=%d, trend filter=%s",
                 config["top_n"], ", ".join(config["always_include"]) or "none",
                 config["atr_period"], config["range_candles"], config["zone_atr_mult"],
                 config["alert_atr_mult"], config["stop_atr_mult"],
                 config["max_range_atr_mult"], config["max_range_pct"],
-                config["min_touches"])
+                config["min_touches"], "on" if config["trend_filter"] else "off")
     logger.info("Monitoring %d perpetual(s); PAXGUSDT included: %s",
                 len(pairs), "yes" if "PAXGUSDT" in pairs else "no")
     logger.info("Schedule: range detection every 4h (UTC-aligned), "
