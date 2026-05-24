@@ -49,6 +49,8 @@ Optional (defaults in parentheses):
     SWING_STRENGTH       (2)         bars on each side that define a swing point
     ZONE_ATR_MULT        (0.5)       cluster swings within this * ATR into a zone
     ALERT_ATR_MULT       (0.25)      alert when within this * ATR of a boundary
+    ENTRY_OFFSET_ATR     (0.05)      place entry this * ATR inside the level so it
+                                     fills on entry into the zone (cuts no-fills)
     STOP_BUFFER_ATR      (0.1)       stop sits this * ATR beyond the level's wick
                                      extreme (tight, structure-based stop)
     STOP_ATR_MULT        (1.0)       fallback stop distance in ATR (only used if
@@ -209,6 +211,7 @@ def get_config():
         "alert_atr_mult": _env_float("ALERT_ATR_MULT", 0.25),
         "stop_atr_mult": _env_float("STOP_ATR_MULT", 1.0),
         "stop_buffer_atr": _env_float("STOP_BUFFER_ATR", 0.1),
+        "entry_offset_atr": _env_float("ENTRY_OFFSET_ATR", 0.05),
         "max_range_atr_mult": _env_float("MAX_RANGE_ATR_MULT", 3.0),
         "max_range_pct": _env_float("MAX_RANGE_PCT", 8.0),
         "min_touches": _env_int("MIN_TOUCHES", 2),
@@ -743,24 +746,27 @@ def run_range_detection(state, client, config):
 def _order_levels(side, rng, config):
     """Return (direction, entry, stop, target, rr) for a buy or sell setup.
 
-    Stop sits just beyond the wick extreme of the swings that formed the level
-    (a tight, structure-based stop), with a small STOP_BUFFER_ATR cushion. Falls
-    back to STOP_ATR_MULT*ATR if wick data isn't present (older saved ranges)."""
+    Entry sits just *inside* the level by ENTRY_OFFSET_ATR (so it fills as price
+    enters the zone rather than needing an exact tag of the level). Stop sits just
+    beyond the wick extreme of the swings that formed the level (a tight,
+    structure-based stop) with a small STOP_BUFFER_ATR cushion; falls back to
+    STOP_ATR_MULT*ATR if wick data isn't present (older saved ranges)."""
     atr = rng["atr"]
     sup = rng["support"]
     res = rng["resistance"]
     buf = config["stop_buffer_atr"] * atr
+    offset = config["entry_offset_atr"] * atr
     if side == "support":
         direction = "BUY AT SUPPORT"
         wick = rng.get("support_low")
         stop = (wick - buf) if wick is not None else sup - config["stop_atr_mult"] * atr
-        entry, target = sup, res
+        entry, target = sup + offset, res
         rr = (target - entry) / (entry - stop) if entry != stop else 0.0
     else:
         direction = "SELL AT RESISTANCE"
         wick = rng.get("resistance_high")
         stop = (wick + buf) if wick is not None else res + config["stop_atr_mult"] * atr
-        entry, target = res, sup
+        entry, target = res - offset, sup
         rr = (entry - target) / (stop - entry) if stop != entry else 0.0
     return direction, entry, stop, target, rr
 
