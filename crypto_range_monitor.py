@@ -1123,12 +1123,13 @@ def review_alerts(client, config):
     n_fill = n_nofill = n_win = n_loss = n_open = n_nodata = n_dup = 0
     total_r = 0.0
     last_kept = {}
+    trades = []  # (is_buy, entry, target, atr, segment) for the stop-distance sweep
     for row in rows:
         try:
             ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             pair, direction = row["pair"], row["direction"]
             entry, stop, target = float(row["entry"]), float(row["stop"]), float(row["target"])
-            rr = float(row["rr"])
+            rr, atr = float(row["rr"]), float(row["atr"])
         except (KeyError, ValueError):
             continue
         is_buy = "BUY" in direction
@@ -1157,8 +1158,11 @@ def review_alerts(client, config):
                 outcome, n_nofill = "no-fill", n_nofill + 1
             else:
                 n_fill += 1
+                seg = bars[fill_i:fill_i + hold_bars]
+                if atr > 0:
+                    trades.append((is_buy, entry, target, atr, seg))
                 outcome = "open"
-                for b in bars[fill_i:fill_i + hold_bars]:
+                for b in seg:
                     hi, lo = float(b[2]), float(b[3])
                     hit_stop = (lo <= stop) if is_buy else (hi >= stop)
                     hit_tgt = (hi >= target) if is_buy else (lo <= target)
@@ -1187,6 +1191,48 @@ def review_alerts(client, config):
               f"expectancy: {total_r / resolved:+.2f}R per trade")
     else:
         print(f"Still open/unresolved: {n_open} - not enough forward data to score yet.")
+
+    _print_stop_sweep(trades)
+
+
+def _print_stop_sweep(trades):
+    """Re-resolve the same filled trades at different stop distances (measured
+    from entry, in ATR) to show whether a wider stop would help and where
+    expectancy peaks. Reward keeps the logged target; risk = stop distance."""
+    if not trades:
+        return
+    print("\n--- Stop-distance sweep (same trades, stop measured from entry) ---")
+    print("How far each trade went against entry decides which stop survives.\n")
+    print(f"{'STOP (xATR)':<12}{'RESOLVED':>10}{'WINS':>7}{'WIN%':>7}{'EXPECTANCY':>13}")
+    print("-" * 49)
+    for d in (0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0):
+        wins = losses = 0
+        tr = 0.0
+        for is_buy, entry, target, atr, seg in trades:
+            stop = entry - d * atr if is_buy else entry + d * atr
+            risk = d * atr
+            res = None
+            for b in seg:
+                hi, lo = float(b[2]), float(b[3])
+                hit_stop = (lo <= stop) if is_buy else (hi >= stop)
+                hit_tgt = (hi >= target) if is_buy else (lo <= target)
+                if hit_stop:
+                    res = "loss"
+                    break
+                if hit_tgt:
+                    res = "win"
+                    break
+            if res == "win":
+                wins += 1
+                tr += abs(target - entry) / risk if risk else 0.0
+            elif res == "loss":
+                losses += 1
+                tr -= 1.0
+        n = wins + losses
+        if n:
+            print(f"{d:<12.2f}{n:>10}{wins:>7}{100.0 * wins / n:>6.0f}%{tr / n:>+12.2f}R")
+    print("\n(stop from entry ~= ENTRY_OFFSET_ATR + STOP_BUFFER_ATR + wick distance; "
+          "use the row with the best expectancy as a guide.)")
 
 
 def run_loop(state, client, config, notifier):
