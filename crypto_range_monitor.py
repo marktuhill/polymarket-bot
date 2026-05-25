@@ -70,6 +70,8 @@ Optional (defaults in parentheses):
     ALERT_TIMEFRAME      (15m)       candle close used as the alert trigger
                                      (1m/3m/5m/15m/30m/1h; lower = faster, noisier)
     ALERT_INTERVAL_MIN   (10)        minutes between alert checks
+    ALERT_COOLDOWN_HOURS (6)         min hours between alerts on the same level/
+                                     side (stops one level chopping out repeats)
     BINANCE_BASE_URL     (https://fapi.binance.com)  USDT-M futures API host
     BINANCE_PROXY        ()          optional http(s) proxy for Binance only,
                                      e.g. http://user:pass@host:port (routes
@@ -224,6 +226,7 @@ def get_config():
         "review_hold_hours": _env_float("REVIEW_HOLD_HOURS", 36.0),
         "alert_timeframe": _env_timeframe("ALERT_TIMEFRAME", "15m"),
         "alert_interval_min": _env_int("ALERT_INTERVAL_MIN", 10),
+        "alert_cooldown_hours": _env_float("ALERT_COOLDOWN_HOURS", 6.0),
         "binance_base_url": os.environ.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/"),
         "proxy": os.environ.get("BINANCE_PROXY", "").strip(),
     }
@@ -614,6 +617,8 @@ def detect_range(symbol, bars, config):
         "detected_at": int(time.time()),
         "alerted_support": False,
         "alerted_resistance": False,
+        "alerted_support_ts": 0,
+        "alerted_resistance_ts": 0,
     }
 
 
@@ -724,8 +729,9 @@ def run_range_detection(state, client, config):
             ranges.pop(symbol, None)
             continue
 
-        # Preserve de-dup flags when the zones barely moved, so a pair parked at
-        # a boundary doesn't re-alert every 4h.
+        # Preserve de-dup flags + last-alert times when the zones barely moved,
+        # so a pair parked at a boundary doesn't re-alert every 4h and the
+        # per-level cooldown survives re-detection.
         old = ranges.get(symbol)
         if old:
             tol = 0.1 * new_range["atr"]
@@ -733,6 +739,8 @@ def run_range_detection(state, client, config):
                     abs(new_range["support"] - old["support"]) < tol):
                 new_range["alerted_support"] = old.get("alerted_support", False)
                 new_range["alerted_resistance"] = old.get("alerted_resistance", False)
+                new_range["alerted_support_ts"] = old.get("alerted_support_ts", 0)
+                new_range["alerted_resistance_ts"] = old.get("alerted_resistance_ts", 0)
         ranges[symbol] = new_range
         detected += 1
 
@@ -863,6 +871,8 @@ def run_alert_check(state, client, config, notifier, dry_run=False):
     checked = 0
     fired = 0
     tf = config["alert_timeframe"]
+    now_ts = time.time()
+    cooldown = config["alert_cooldown_hours"] * 3600
     for symbol, rng in ranges.items():
         bars = client.get_klines(symbol, tf, 2)
         if not bars:
@@ -874,20 +884,26 @@ def run_alert_check(state, client, config, notifier, dry_run=False):
         res = rng["resistance"]
         side = evaluate_alert(close, rng, config)
 
-        # Bounce off support -> buy. Re-arm only once price leaves the band.
+        # Bounce off support -> buy. Fire only if armed AND past the per-level
+        # cooldown (stops the same level chopping out repeated alerts). Re-arm
+        # once price leaves the band.
         if side == "support":
-            if not rng.get("alerted_support"):
+            cooled = now_ts - rng.get("alerted_support_ts", 0) >= cooldown
+            if not rng.get("alerted_support") and cooled:
                 _emit_alert(symbol, "support", rng, close, config, ticks, notifier, dry_run)
                 rng["alerted_support"] = True
+                rng["alerted_support_ts"] = now_ts
                 fired += 1
         elif abs(close - sup) > 1.5 * proximity:
             rng["alerted_support"] = False
 
         # Rejection at resistance -> sell.
         if side == "resistance":
-            if not rng.get("alerted_resistance"):
+            cooled = now_ts - rng.get("alerted_resistance_ts", 0) >= cooldown
+            if not rng.get("alerted_resistance") and cooled:
                 _emit_alert(symbol, "resistance", rng, close, config, ticks, notifier, dry_run)
                 rng["alerted_resistance"] = True
+                rng["alerted_resistance_ts"] = now_ts
                 fired += 1
         elif abs(close - res) > 1.5 * proximity:
             rng["alerted_resistance"] = False
@@ -1091,18 +1107,22 @@ def review_alerts(client, config):
         print("Alert log is empty - nothing to review yet.")
         return
 
+    rows.sort(key=lambda r: r.get("timestamp", ""))
     interval, bar_min = "5m", 5
     fill_bars = max(1, int(config["review_fill_hours"] * 60 / bar_min))
     hold_bars = max(1, int(config["review_hold_hours"] * 60 / bar_min))
+    cooldown_s = config["alert_cooldown_hours"] * 3600
 
     print(f"Reviewing {len(rows)} alert(s) | fill window {config['review_fill_hours']:.0f}h, "
-          f"max hold {config['review_hold_hours']:.0f}h, {interval} resolution\n")
+          f"max hold {config['review_hold_hours']:.0f}h, dedup {config['alert_cooldown_hours']:.0f}h, "
+          f"{interval} resolution\n")
     print("-" * 88)
     print(f"{'TIME (UTC)':<21}{'PAIR':<13}{'DIR':<5}{'ENTRY':>13}{'OUTCOME':>12}{'R':>8}")
     print("-" * 88)
 
-    n_fill = n_nofill = n_win = n_loss = n_open = n_nodata = 0
+    n_fill = n_nofill = n_win = n_loss = n_open = n_nodata = n_dup = 0
     total_r = 0.0
+    last_kept = {}
     for row in rows:
         try:
             ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
@@ -1112,6 +1132,15 @@ def review_alerts(client, config):
         except (KeyError, ValueError):
             continue
         is_buy = "BUY" in direction
+        # Collapse repeats: same pair+side within the cooldown window = one setup.
+        key = (pair, direction)
+        prev = last_kept.get(key)
+        if prev is not None and ts.timestamp() - prev < cooldown_s:
+            n_dup += 1
+            print(f"{row['timestamp']:<21}{pair:<13}{('BUY' if is_buy else 'SELL'):<5}"
+                  f"{entry:>13.6g}{'dup':>12}{'-':>8}")
+            continue
+        last_kept[key] = ts.timestamp()
         bars = _fetch_klines_from(client, pair, interval,
                                   int(ts.timestamp() * 1000), fill_bars + hold_bars + 5)
         outcome, r = "?", 0.0
@@ -1149,7 +1178,9 @@ def review_alerts(client, config):
 
     resolved = n_win + n_loss
     print("-" * 88)
-    print(f"\nAlerts: {len(rows)} | filled: {n_fill} | no-fill: {n_nofill} | no-data: {n_nodata}")
+    print(f"\nAlerts: {len(rows)} | distinct setups: {len(rows) - n_dup} "
+          f"(deduped {n_dup} repeat(s)) | filled: {n_fill} | no-fill: {n_nofill} | "
+          f"no-data: {n_nodata}")
     if resolved:
         print(f"Resolved: {resolved} (wins {n_win}, losses {n_loss}) | still open: {n_open}")
         print(f"Win rate: {100.0 * n_win / resolved:.0f}%  |  total: {total_r:+.2f}R  |  "
