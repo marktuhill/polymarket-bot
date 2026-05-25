@@ -710,11 +710,12 @@ def refresh_pairs(state, client, config):
 
 
 # --------------------------------------------------------------------------- #
-# Market regime (measured, not gated -- a higher-timeframe + breadth read)
+# Market regime (measured, not gated -- driven by top-100 breadth)
 # --------------------------------------------------------------------------- #
 def classify_btc_trend(client):
-    """BTC daily trend as the market's master switch: price vs a 20d SMA and the
-    SMA's slope. Returns 'up' / 'down' / 'flat' (or 'unknown' if no data)."""
+    """BTC daily trend (price vs a 20d SMA and the SMA's slope), recorded as
+    context alongside the breadth-based regime. Returns 'up'/'down'/'flat' (or
+    'unknown' if no data)."""
     bars = client.get_klines("BTCUSDT", "1d", 30)
     if not bars or len(bars) < 25:
         return "unknown"
@@ -731,25 +732,28 @@ def classify_btc_trend(client):
 
 
 def update_regime(state, client, config):
-    """Combine universe breadth (% of pairs trending up) with BTC's daily trend
-    into a market regime label. Measured only -- it tags alerts but doesn't gate
-    them, so we can validate it across regimes before acting on it."""
+    """Market regime from universe breadth alone: long if >= REGIME_BREADTH_PCT
+    of the top-100 are trending up, short if that many are down, else neutral.
+    Measured only -- it tags alerts but doesn't gate them, so we can validate it
+    across regimes before acting. BTC's daily trend is recorded as context only
+    (not part of the call) so we can compare approaches later."""
     breadth = state.get("breadth", {})
     total = sum(breadth.values())
     up_pct = 100.0 * breadth.get("up", 0) / total if total else 0.0
-    btc = classify_btc_trend(client)
+    down_pct = 100.0 * breadth.get("down", 0) / total if total else 0.0
     thr = config["regime_breadth_pct"]
-    if btc == "up" and up_pct >= thr:
+    if up_pct >= thr:
         regime = "long"
-    elif btc == "down" and up_pct <= 100 - thr:
+    elif down_pct >= thr:
         regime = "short"
     else:
         regime = "neutral"
+    btc = classify_btc_trend(client)  # context only; not used in the regime call
     state["regime"] = regime
     state["breadth_up_pct"] = up_pct
     state["btc_trend"] = btc
-    logger.info("Market regime: %s (breadth %.0f%% up of %d pairs, BTC daily %s)",
-                regime.upper(), up_pct, total, btc)
+    logger.info("Market regime: %s (breadth %.0f%% up / %.0f%% down of %d pairs; "
+                "BTC daily %s [context])", regime.upper(), up_pct, down_pct, total, btc)
     for rng in state.get("ranges", {}).values():
         rng["regime"] = regime
     return regime
