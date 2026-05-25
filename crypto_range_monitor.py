@@ -1350,6 +1350,51 @@ def run_experiment(client, config):
     print("With this few trades the 'best' cell is likely overfit - treat as a "
           "direction to confirm as data grows.")
 
+    # Subgroup breakdown (which directions / coins carry vs bleed) at one
+    # representative exit, so we can see if a filter would help.
+    ref_stop, ref_tgt = bS, bT
+
+    def subset(sub):
+        w = l = 0
+        tr = 0.0
+        for t in sub:
+            stop = t["entry"] - ref_stop * t["atr"] if t["is_buy"] else t["entry"] + ref_stop * t["atr"]
+            risk = ref_stop * t["atr"]
+            tgt = (t["target"] if ref_tgt == "full"
+                   else (t["entry"] + ref_tgt * t["atr"] if t["is_buy"] else t["entry"] - ref_tgt * t["atr"]))
+            res = _resolve_seg(t["seg"], t["is_buy"], stop, tgt)
+            if res == "win":
+                w += 1
+                tr += abs(tgt - t["entry"]) / risk if risk else 0.0
+            elif res == "loss":
+                l += 1
+                tr -= 1.0
+        n = w + l
+        return n, w, tr
+
+    reflabel = f"stop {ref_stop}xATR + target {ref_tgt if ref_tgt == 'full' else str(ref_tgt) + 'xATR'}"
+    print(f"\n--- Breakdown at the best exit ({reflabel}) ---")
+    print("By direction:")
+    for label, sub in (("BUY", [t for t in trades if t["is_buy"]]),
+                       ("SELL", [t for t in trades if not t["is_buy"]])):
+        n, w, tr = subset(sub)
+        wr = 100.0 * w / n if n else 0.0
+        exp = tr / n if n else 0.0
+        print(f"  {label:<5} n={n:<3} win {wr:>3.0f}%  total {tr:>+7.2f}R  exp {exp:>+.2f}R")
+
+    by_coin = {}
+    for t in trades:
+        by_coin.setdefault(t["pair"], []).append(t)
+    rows = []
+    for pair, sub in by_coin.items():
+        n, w, tr = subset(sub)
+        if n:
+            rows.append((tr, pair, n, w))
+    rows.sort()  # worst total R first
+    print("\nBy coin (worst total R first):")
+    for tr, pair, n, w in rows:
+        print(f"  {pair:<14} n={n:<3} win {100.0 * w / n:>3.0f}%  total {tr:>+7.2f}R")
+
 
 def run_loop(state, client, config, notifier):
     """The continuous scheduler: detection (4h), alerts, refresh (24h)."""
