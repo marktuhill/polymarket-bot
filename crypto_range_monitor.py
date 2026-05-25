@@ -134,7 +134,7 @@ DETECT_DELAY = 30                 # wait this long after bar close before pullin
 MAX_SLEEP = 120                   # never sleep longer than this between wakes
 
 CSV_HEADER = ["timestamp", "pair", "direction", "entry", "stop", "target",
-              "rr", "zone_high", "zone_low", "atr", "regime"]
+              "rr", "zone_high", "zone_low", "atr", "regime", "box_broken"]
 
 # Trading pairs whose base asset matches these are skipped (stablecoins).
 STABLE_BASES = {
@@ -867,6 +867,19 @@ def build_alert_message(symbol, side, rng, current, config, ticks):
     ])
 
 
+def _box_broken_label(rng):
+    """'none' / 'support' / 'resistance' / 'both' -- which boundaries had a recent
+    decisive close beyond them when the alert fired."""
+    sb, rb = rng.get("support_broken"), rng.get("resistance_broken")
+    if sb and rb:
+        return "both"
+    if sb:
+        return "support"
+    if rb:
+        return "resistance"
+    return "none"
+
+
 def _record_alert_csv(symbol, side, rng, config, ticks):
     direction, entry, stop, target, rr = _order_levels(side, rng, config)
 
@@ -880,6 +893,10 @@ def _record_alert_csv(symbol, side, rng, config, ticks):
         "rr": f"{rr:.2f}", "zone_high": disp(rng["resistance"]),
         "zone_low": disp(rng["support"]), "atr": disp(rng["atr"]),
         "regime": rng.get("regime", ""),
+        # Was the box already compromised when this fired? (a side that closed
+        # decisively beyond its boundary). Recorded only -- lets --experiment
+        # later compare clean boxes vs. ones price had broken out of.
+        "box_broken": _box_broken_label(rng),
     }
     try:
         _append_alert_row(row)
