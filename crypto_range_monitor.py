@@ -778,9 +778,11 @@ def run_range_detection(state, client, config):
         if not bars or len(bars) < config["atr_period"] + 1:
             ranges.pop(symbol, None)
             continue
-        # Tally each pair's trend for market breadth (regardless of range).
-        atr_b = compute_atr(bars, config["atr_period"])
-        breadth[classify_trend(bars, atr_b, config) if atr_b else "flat"] += 1
+        # Tally each pair's trend for market breadth (crypto only -- skip forced
+        # non-crypto includes like PAXG/gold, which don't reflect crypto regime).
+        if symbol not in config["always_include"]:
+            atr_b = compute_atr(bars, config["atr_period"])
+            breadth[classify_trend(bars, atr_b, config) if atr_b else "flat"] += 1
         new_range = detect_range(symbol, bars, config)
         if new_range is None:
             ranges.pop(symbol, None)
