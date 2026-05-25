@@ -134,7 +134,7 @@ DETECT_DELAY = 30                 # wait this long after bar close before pullin
 MAX_SLEEP = 120                   # never sleep longer than this between wakes
 
 CSV_HEADER = ["timestamp", "pair", "direction", "entry", "stop", "target",
-              "rr", "zone_high", "zone_low", "atr"]
+              "rr", "zone_high", "zone_low", "atr", "regime"]
 
 # Trading pairs whose base asset matches these are skipped (stablecoins).
 STABLE_BASES = {
@@ -229,6 +229,7 @@ def get_config():
         "alert_timeframe": _env_timeframe("ALERT_TIMEFRAME", "15m"),
         "alert_interval_min": _env_int("ALERT_INTERVAL_MIN", 10),
         "alert_cooldown_hours": _env_float("ALERT_COOLDOWN_HOURS", 6.0),
+        "regime_breadth_pct": _env_float("REGIME_BREADTH_PCT", 55.0),
         "binance_base_url": os.environ.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/"),
         "proxy": os.environ.get("BINANCE_PROXY", "").strip(),
     }
@@ -709,6 +710,52 @@ def refresh_pairs(state, client, config):
 
 
 # --------------------------------------------------------------------------- #
+# Market regime (measured, not gated -- a higher-timeframe + breadth read)
+# --------------------------------------------------------------------------- #
+def classify_btc_trend(client):
+    """BTC daily trend as the market's master switch: price vs a 20d SMA and the
+    SMA's slope. Returns 'up' / 'down' / 'flat' (or 'unknown' if no data)."""
+    bars = client.get_klines("BTCUSDT", "1d", 30)
+    if not bars or len(bars) < 25:
+        return "unknown"
+    closes = [b[2] for b in bars]
+    n = 20
+    sma_now = sum(closes[-n:]) / n
+    sma_prev = sum(closes[-n - 5:-5]) / n
+    last = closes[-1]
+    if last > sma_now and sma_now > sma_prev:
+        return "up"
+    if last < sma_now and sma_now < sma_prev:
+        return "down"
+    return "flat"
+
+
+def update_regime(state, client, config):
+    """Combine universe breadth (% of pairs trending up) with BTC's daily trend
+    into a market regime label. Measured only -- it tags alerts but doesn't gate
+    them, so we can validate it across regimes before acting on it."""
+    breadth = state.get("breadth", {})
+    total = sum(breadth.values())
+    up_pct = 100.0 * breadth.get("up", 0) / total if total else 0.0
+    btc = classify_btc_trend(client)
+    thr = config["regime_breadth_pct"]
+    if btc == "up" and up_pct >= thr:
+        regime = "long"
+    elif btc == "down" and up_pct <= 100 - thr:
+        regime = "short"
+    else:
+        regime = "neutral"
+    state["regime"] = regime
+    state["breadth_up_pct"] = up_pct
+    state["btc_trend"] = btc
+    logger.info("Market regime: %s (breadth %.0f%% up of %d pairs, BTC daily %s)",
+                regime.upper(), up_pct, total, btc)
+    for rng in state.get("ranges", {}).values():
+        rng["regime"] = regime
+    return regime
+
+
+# --------------------------------------------------------------------------- #
 # Detection & alerting
 # --------------------------------------------------------------------------- #
 def run_range_detection(state, client, config):
@@ -720,12 +767,16 @@ def run_range_detection(state, client, config):
     ranges = state.setdefault("ranges", {})
     logger.info("Range detection starting for %d pair(s)", len(pairs))
     detected = 0
+    breadth = {"up": 0, "down": 0, "flat": 0}
 
     for symbol in pairs:
         bars = client.get_klines(symbol, "4h", config["range_candles"])
         if not bars or len(bars) < config["atr_period"] + 1:
             ranges.pop(symbol, None)
             continue
+        # Tally each pair's trend for market breadth (regardless of range).
+        atr_b = compute_atr(bars, config["atr_period"])
+        breadth[classify_trend(bars, atr_b, config) if atr_b else "flat"] += 1
         new_range = detect_range(symbol, bars, config)
         if new_range is None:
             ranges.pop(symbol, None)
@@ -749,7 +800,9 @@ def run_range_detection(state, client, config):
     for stale in [s for s in ranges if s not in pairs]:
         ranges.pop(stale, None)
 
+    state["breadth"] = breadth
     logger.info("Range detection complete: %d valid range(s)", detected)
+    update_regime(state, client, config)
     return detected
 
 
@@ -814,20 +867,40 @@ def _record_alert_csv(symbol, side, rng, config, ticks):
     def disp(price):
         return fmt_price(price, symbol, ticks)
 
-    row = [
-        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        symbol, direction, disp(entry), disp(stop), disp(target),
-        f"{rr:.2f}", disp(rng["resistance"]), disp(rng["support"]), disp(rng["atr"]),
-    ]
+    row = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "pair": symbol, "direction": direction,
+        "entry": disp(entry), "stop": disp(stop), "target": disp(target),
+        "rr": f"{rr:.2f}", "zone_high": disp(rng["resistance"]),
+        "zone_low": disp(rng["support"]), "atr": disp(rng["atr"]),
+        "regime": rng.get("regime", ""),
+    }
     try:
-        new_file = not os.path.isfile(ALERTS_CSV)
-        with open(ALERTS_CSV, "a", newline="", encoding="utf-8") as fh:
-            writer = csv.writer(fh)
-            if new_file:
-                writer.writerow(CSV_HEADER)
-            writer.writerow(row)
+        _append_alert_row(row)
     except OSError as exc:
         logger.warning("Could not write alert CSV: %s", exc)
+
+
+def _append_alert_row(row):
+    """Append a row, migrating the CSV header in place if a column was added
+    (old rows get blanks for the new field)."""
+    old_header, existing = None, []
+    if os.path.isfile(ALERTS_CSV):
+        with open(ALERTS_CSV, "r", newline="", encoding="utf-8") as fh:
+            data = list(csv.reader(fh))
+        if data:
+            old_header, existing = data[0], data[1:]
+    if old_header == CSV_HEADER:
+        with open(ALERTS_CSV, "a", newline="", encoding="utf-8") as fh:
+            csv.DictWriter(fh, fieldnames=CSV_HEADER).writerow(row)
+        return
+    with open(ALERTS_CSV, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(CSV_HEADER)
+        for old in existing:
+            mapped = dict(zip(old_header, old)) if old_header else {}
+            writer.writerow([mapped.get(col, "") for col in CSV_HEADER])
+        csv.DictWriter(fh, fieldnames=CSV_HEADER).writerow(row)
 
 
 def _emit_alert(symbol, side, rng, current, config, ticks, notifier, dry_run):
@@ -1026,6 +1099,10 @@ def print_range_status(state, client, config):
     if not ranges:
         return signals
     tf = config["alert_timeframe"]
+    if state.get("regime"):
+        print(f"\nMarket regime: {state['regime'].upper()} "
+              f"(breadth {state.get('breadth_up_pct', 0):.0f}% up, "
+              f"BTC daily {state.get('btc_trend', '?')})")
     print(f"\n--- Live position vs range (latest {tf} close) ---")
     print("-" * 92)
     print(f"{'PAIR':<14}{'CLOSE':>14}{'TREND':>7}"
@@ -1293,7 +1370,8 @@ def _collect_trades(client, config):
         if fill_i is None:
             continue
         out.append(dict(pair=pair, is_buy=is_buy, entry=entry, target=target,
-                        atr=atr, seg=bars[fill_i:fill_i + hold_bars]))
+                        atr=atr, regime=row.get("regime", "") or "?",
+                        seg=bars[fill_i:fill_i + hold_bars]))
     return out
 
 
@@ -1381,6 +1459,16 @@ def run_experiment(client, config):
         wr = 100.0 * w / n if n else 0.0
         exp = tr / n if n else 0.0
         print(f"  {label:<5} n={n:<3} win {wr:>3.0f}%  total {tr:>+7.2f}R  exp {exp:>+.2f}R")
+
+    regimes = sorted({t.get("regime", "?") for t in trades})
+    if regimes != ["?"]:
+        print("\nBy regime (needs data across regimes to be meaningful):")
+        for reg in regimes:
+            sub = [t for t in trades if t.get("regime", "?") == reg]
+            n, w, tr = subset(sub)
+            wr = 100.0 * w / n if n else 0.0
+            exp = tr / n if n else 0.0
+            print(f"  {reg:<8} n={n:<3} win {wr:>3.0f}%  total {tr:>+7.2f}R  exp {exp:>+.2f}R")
 
     by_coin = {}
     for t in trades:
