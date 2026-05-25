@@ -88,6 +88,8 @@ Command-line flags
     --review  Forward-test logged alerts: for each row in the alert CSV, fetch
               later 5m price and report whether it filled and hit target or stop
               first, plus win-rate / expectancy. Read-only (needs Binance).
+    --experiment  Sweep stop x target exit rules over the logged alerts and print
+              win-rate / expectancy grids to search for a better exit. Read-only.
 
 Deploying on a Linux VPS (survive reboots)
 -----------------------------------------
@@ -1235,6 +1237,120 @@ def _print_stop_sweep(trades):
           "use the row with the best expectancy as a guide.)")
 
 
+def _resolve_seg(seg, is_buy, stop, target):
+    """Which is hit first over a 5m segment. Conservative: stop wins ties."""
+    for b in seg:
+        hi, lo = float(b[2]), float(b[3])
+        hit_stop = (lo <= stop) if is_buy else (hi >= stop)
+        hit_tgt = (hi >= target) if is_buy else (lo <= target)
+        if hit_stop:
+            return "loss"
+        if hit_tgt:
+            return "win"
+    return "open"
+
+
+def _collect_trades(client, config):
+    """Filled, deduped alerts with their forward 5m price path, for exit-rule
+    experiments. Each: dict(pair, is_buy, entry, target, atr, seg)."""
+    if not os.path.isfile(ALERTS_CSV):
+        return []
+    try:
+        with open(ALERTS_CSV, "r", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+    except OSError:
+        return []
+    rows.sort(key=lambda r: r.get("timestamp", ""))
+    bar_min = 5
+    fill_bars = max(1, int(config["review_fill_hours"] * 60 / bar_min))
+    hold_bars = max(1, int(config["review_hold_hours"] * 60 / bar_min))
+    cooldown_s = config["alert_cooldown_hours"] * 3600
+    last, out = {}, []
+    for row in rows:
+        try:
+            ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            pair, direction = row["pair"], row["direction"]
+            entry, target, atr = float(row["entry"]), float(row["target"]), float(row["atr"])
+        except (KeyError, ValueError):
+            continue
+        key = (pair, direction)
+        if key in last and ts.timestamp() - last[key] < cooldown_s:
+            continue
+        last[key] = ts.timestamp()
+        if atr <= 0:
+            continue
+        is_buy = "BUY" in direction
+        bars = _fetch_klines_from(client, pair, "5m",
+                                  int(ts.timestamp() * 1000), fill_bars + hold_bars + 5)
+        if not bars:
+            continue
+        fill_i = None
+        for i, b in enumerate(bars[:fill_bars]):
+            hi, lo = float(b[2]), float(b[3])
+            if (is_buy and lo <= entry) or (not is_buy and hi >= entry):
+                fill_i = i
+                break
+        if fill_i is None:
+            continue
+        out.append(dict(pair=pair, is_buy=is_buy, entry=entry, target=target,
+                        atr=atr, seg=bars[fill_i:fill_i + hold_bars]))
+    return out
+
+
+def run_experiment(client, config):
+    """Sweep stop x target exit rules over the real fired alerts to look for a
+    combo that lifts win rate / expectancy. Forward data only (optimises exits on
+    actual signals, not a backtest of entries)."""
+    trades = _collect_trades(client, config)
+    if not trades:
+        print("No filled trades to experiment on yet - let the bot run longer.")
+        return
+    nbuy = sum(1 for t in trades if t["is_buy"])
+    print(f"Experimenting on {len(trades)} filled, deduped trades "
+          f"({nbuy} buy / {len(trades) - nbuy} sell).")
+    print("WARNING: tiny sample -> everything below is a hypothesis, not proof.\n")
+
+    stops = [0.1, 0.2, 0.3, 0.5]
+    tgts = [1.0, 1.5, 2.0, 3.0, "full"]
+
+    def cell(S, T):
+        w = l = 0
+        tr = 0.0
+        for t in trades:
+            stop = t["entry"] - S * t["atr"] if t["is_buy"] else t["entry"] + S * t["atr"]
+            risk = S * t["atr"]
+            tgt = (t["target"] if T == "full"
+                   else (t["entry"] + T * t["atr"] if t["is_buy"] else t["entry"] - T * t["atr"]))
+            res = _resolve_seg(t["seg"], t["is_buy"], stop, tgt)
+            if res == "win":
+                w += 1
+                tr += abs(tgt - t["entry"]) / risk if risk else 0.0
+            elif res == "loss":
+                l += 1
+                tr -= 1.0
+        n = w + l
+        return n, (100.0 * w / n if n else 0.0), (tr / n if n else 0.0)
+
+    grid = {(S, T): cell(S, T) for S in stops for T in tgts}
+    hdr = "  stop\\tgt" + "".join(f"{(str(x) + 'x' if x != 'full' else 'full'):>8}" for x in tgts)
+
+    print("WIN RATE %  (rows = stop xATR, cols = target):")
+    print(hdr)
+    for S in stops:
+        print(f"  {S:>6.1f} " + "".join(f"{grid[(S, T)][1]:>7.0f}%" for T in tgts))
+
+    print("\nEXPECTANCY R/trade:")
+    print(hdr)
+    for S in stops:
+        print(f"  {S:>6.1f} " + "".join(f"{grid[(S, T)][2]:>+8.2f}" for T in tgts))
+
+    (bS, bT), (bn, bwr, be) = max(grid.items(), key=lambda kv: kv[1][2])
+    print(f"\nBest expectancy: {be:+.2f}R at stop {bS}xATR + target "
+          f"{bT if bT == 'full' else str(bT) + 'xATR'} (win {bwr:.0f}%, n={bn}).")
+    print("With this few trades the 'best' cell is likely overfit - treat as a "
+          "direction to confirm as data grows.")
+
+
 def run_loop(state, client, config, notifier):
     """The continuous scheduler: detection (4h), alerts, refresh (24h)."""
     pairs = refresh_pairs(state, client, config)
@@ -1323,6 +1439,9 @@ def parse_args():
     parser.add_argument("--review", action="store_true",
                         help="Forward-test logged alerts (crypto_range_alerts.csv): "
                              "resolve each against later price and print stats.")
+    parser.add_argument("--experiment", action="store_true",
+                        help="Sweep stop x target exit rules over the logged "
+                             "alerts to look for higher win rate / expectancy.")
     return parser.parse_args()
 
 
@@ -1345,6 +1464,10 @@ def main():
 
     if args.review:
         review_alerts(client, config)
+        return
+
+    if args.experiment:
+        run_experiment(client, config)
         return
 
     missing = [name for name, key in (("TELEGRAM_BOT_TOKEN", "telegram_token"),
