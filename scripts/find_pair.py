@@ -42,6 +42,23 @@ from backtest.xau_data import fetch_xauusd_daily
 START = "2020-01-01"
 TARGET_VOL = 0.10
 PLOT_PATH = ROOT / "results" / "best_pair_equity.png"
+PLOT_PATH_CROSS = ROOT / "results" / "best_pair_xau_crypto_equity.png"
+
+
+def _plot_pair(a: str, b: str, corr: float, leg_a, leg_b, combined, path: Path, title_prefix: str) -> None:
+    fig, ax = plt.subplots(figsize=(11, 6))
+    ax.plot(equity_from_returns(leg_a).index, equity_from_returns(leg_a).values, label=f"{a} (vol-scaled)")
+    ax.plot(equity_from_returns(leg_b).index, equity_from_returns(leg_b).values, label=f"{b} (vol-scaled)")
+    ax.plot(equity_from_returns(combined).index, equity_from_returns(combined).values, label="50/50 combo", linewidth=2.0)
+    ax.set_title(f"{title_prefix}: {a}  +  {b}   (corr={corr:+.2f})")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Equity ($)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
 
 
 def _bb_event_returns(label: str, df: pd.DataFrame, **kwargs) -> StrategyRun:
@@ -77,6 +94,12 @@ def collect_runs() -> list[StrategyRun]:
     xau = fetch_xauusd_daily()
     xau = xau[xau.index >= pd.Timestamp(START)]
     runs.append(_bb_event_returns("BBevent/XAU", xau))
+
+    xau_vec = xau[["close"]].copy()
+    xau_vec["date"] = xau.index
+    xau_vec = xau_vec[["date", "close"]].reset_index(drop=True)
+    runs.append(_vec_returns("EMACross/XAU", xau_vec, ema_cross))
+    runs.append(_vec_returns("EMACrossTS/XAU", xau_vec, ema_cross_trailing_stop))
 
     return runs
 
@@ -116,6 +139,19 @@ def main() -> None:
     top["corr"] = top["corr"].map(lambda x: f"{x:+.2f}")
     print(top.to_string(index=False))
 
+    cross_asset = ranking[
+        ranking.apply(lambda r: ("/XAU" in r["leg_a"]) != ("/XAU" in r["leg_b"]), axis=1)
+    ].head(5).copy()
+    print("\nTop 5 cross-asset-class pairs (one XAU leg + one crypto leg):")
+    if cross_asset.empty:
+        print("  none — no profitable XAU strategy in the candidate set.")
+    else:
+        for col in ("combined_ann_return", "combined_max_dd", "combined_total"):
+            cross_asset[col] = cross_asset[col].map(lambda x: f"{x:+.2%}")
+        cross_asset["combined_sharpe"] = cross_asset["combined_sharpe"].map(lambda x: f"{x:.2f}")
+        cross_asset["corr"] = cross_asset["corr"].map(lambda x: f"{x:+.2f}")
+        print(cross_asset.to_string(index=False))
+
     winner = ranking.iloc[0]
     a, b = winner["leg_a"], winner["leg_b"]
     print(f"\n=== Best pair: {a}  +  {b} ===")
@@ -134,19 +170,31 @@ def main() -> None:
         else:
             print(f"  {key:<14} {ma:>12.2%} {mb:>12.2%} {mc:>12.2%}")
 
-    fig, ax = plt.subplots(figsize=(11, 6))
-    ax.plot(equity_from_returns(leg_a_scaled).index, equity_from_returns(leg_a_scaled).values, label=f"{a} (vol-scaled)")
-    ax.plot(equity_from_returns(leg_b_scaled).index, equity_from_returns(leg_b_scaled).values, label=f"{b} (vol-scaled)")
-    ax.plot(equity_from_returns(combined).index, equity_from_returns(combined).values, label="50/50 combo", linewidth=2.0)
-    ax.set_title(f"Best uncorrelated pair: {a}  +  {b}   (corr={winner['corr']:+.2f})")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Equity ($)")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    PLOT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(PLOT_PATH, dpi=120)
+    _plot_pair(a, b, winner["corr"], leg_a_scaled, leg_b_scaled, combined, PLOT_PATH, "Best overall pair")
     print(f"\nSaved equity curve: {PLOT_PATH.relative_to(ROOT)}")
+
+    cross_raw = ranking[
+        ranking.apply(lambda r: ("/XAU" in r["leg_a"]) != ("/XAU" in r["leg_b"]), axis=1)
+    ]
+    if not cross_raw.empty:
+        cw = cross_raw.iloc[0]
+        ca, cb = cw["leg_a"], cw["leg_b"]
+        print(f"\n=== Best cross-asset pair: {ca}  +  {cb} ===")
+        print(f"  raw return correlation : {cw['corr']:+.3f}")
+        leg_ca_scaled = vol_scale(frame[ca], TARGET_VOL)
+        leg_cb_scaled = vol_scale(frame[cb], TARGET_VOL)
+        combined_cross = 0.5 * leg_ca_scaled + 0.5 * leg_cb_scaled
+        print(f"\n  {'metric':<14} {'leg A':>12} {'leg B':>12} {'50/50':>12}")
+        for key in ("total_return", "ann_return", "sharpe", "max_dd"):
+            ma = metrics(leg_ca_scaled)[key]
+            mb = metrics(leg_cb_scaled)[key]
+            mc = metrics(combined_cross)[key]
+            if key == "sharpe":
+                print(f"  {key:<14} {ma:>12.2f} {mb:>12.2f} {mc:>12.2f}")
+            else:
+                print(f"  {key:<14} {ma:>12.2%} {mb:>12.2%} {mc:>12.2%}")
+        _plot_pair(ca, cb, cw["corr"], leg_ca_scaled, leg_cb_scaled, combined_cross, PLOT_PATH_CROSS, "Best cross-asset pair (XAU + crypto)")
+        print(f"\nSaved cross-asset equity curve: {PLOT_PATH_CROSS.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":
