@@ -121,6 +121,48 @@ def buy_and_hold(df: pd.DataFrame) -> pd.Series:
     return pd.Series(1, index=df.index, dtype=int)
 
 
+def ema_cross_long(df: pd.DataFrame, fast: int = 50, slow: int = 100) -> pd.Series:
+    """Long-only EMA cross. Position is +1 when fast >= slow, 0 otherwise."""
+    fast_e = ema(df["close"], fast)
+    slow_e = ema(df["close"], slow)
+    pos = pd.Series(0, index=df.index, dtype=int)
+    pos[fast_e >= slow_e] = 1
+    pos.iloc[: max(fast, slow)] = 0
+    return pos
+
+
+def donchian_breakout(
+    df: pd.DataFrame, entry_window: int = 20, exit_window: int = 10
+) -> pd.Series:
+    """Long-only Donchian (Turtle-style) breakout.
+
+    Enter long when close breaks above the prior ``entry_window``-bar high.
+    Exit when close breaks below the prior ``exit_window``-bar low.
+    Uses high/low if present, otherwise falls back to close.
+    """
+    high = df["high"] if "high" in df.columns else df["close"]
+    low = df["low"] if "low" in df.columns else df["close"]
+    close = df["close"]
+
+    entry_high = high.rolling(entry_window).max().shift(1)
+    exit_low = low.rolling(exit_window).min().shift(1)
+
+    c = close.to_numpy()
+    eh = entry_high.to_numpy()
+    el = exit_low.to_numpy()
+    n = len(df)
+    pos = np.zeros(n, dtype=int)
+    state = 0
+    warmup = max(entry_window, exit_window) + 1
+    for i in range(warmup, n):
+        if state == 0 and c[i] > eh[i]:
+            state = 1
+        elif state == 1 and c[i] < el[i]:
+            state = 0
+        pos[i] = state
+    return pd.Series(pos, index=df.index)
+
+
 STRATEGIES = {
     "BuyAndHold": buy_and_hold,
     "EMACross": ema_cross,

@@ -34,7 +34,9 @@ from backtest.portfolio import (
 )
 from backtest.strategies import (
     bb_mean_reversion,
+    donchian_breakout,
     ema_cross,
+    ema_cross_long,
     ema_cross_trailing_stop,
 )
 from backtest.xau_data import fetch_xauusd_daily
@@ -95,11 +97,16 @@ def collect_runs() -> list[StrategyRun]:
     xau = xau[xau.index >= pd.Timestamp(START)]
     runs.append(_bb_event_returns("BBevent/XAU", xau))
 
-    xau_vec = xau[["close"]].copy()
+    xau_vec = xau[["open", "high", "low", "close"]].copy()
     xau_vec["date"] = xau.index
-    xau_vec = xau_vec[["date", "close"]].reset_index(drop=True)
+    xau_vec = xau_vec.reset_index(drop=True)
     runs.append(_vec_returns("EMACross/XAU", xau_vec, ema_cross))
     runs.append(_vec_returns("EMACrossTS/XAU", xau_vec, ema_cross_trailing_stop))
+    runs.append(_vec_returns("EMALong-50-100/XAU", xau_vec, lambda d: ema_cross_long(d, 50, 100)))
+    runs.append(_vec_returns("EMALong-50-200/XAU", xau_vec, lambda d: ema_cross_long(d, 50, 200)))
+    runs.append(_vec_returns("EMALong-20-50/XAU", xau_vec, lambda d: ema_cross_long(d, 20, 50)))
+    runs.append(_vec_returns("Donchian-20-10/XAU", xau_vec, lambda d: donchian_breakout(d, 20, 10)))
+    runs.append(_vec_returns("Donchian-55-20/XAU", xau_vec, lambda d: donchian_breakout(d, 55, 20)))
 
     return runs
 
