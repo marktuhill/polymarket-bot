@@ -1,9 +1,9 @@
 """Fetch and cache XAUUSD daily OHLC data.
 
 The prompt asked for Dukascopy via `dukascopy-python`, but the container's network
-allowlist blocks Dukascopy's data servers. The `FeziweMelvin/XAUUSD-Gold-Price`
-GitHub repo mirrors a Dukascopy-style daily file (`XAU_1d_data.csv`) covering
-2004-06-11 to 2025-06-06, which is reachable from `raw.githubusercontent.com`.
+allowlist blocks Dukascopy's data servers. A GitHub repo mirrors a Dukascopy-style
+daily file (`XAU_1d_data.csv`) covering 2004-06-11 to 2025-12-31, reachable from
+`raw.githubusercontent.com`.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-CSV_URL = "https://raw.githubusercontent.com/FeziweMelvin/XAUUSD-Gold-Price/main/XAU_1d_data.csv"
+CSV_URL = "https://raw.githubusercontent.com/xxkyuubixx354-dotcom/QLSTM-LSTM-Evaluation/main/XAU_1d_data.csv"
 ROOT = Path(__file__).resolve().parent.parent
 PARQUET_PATH = ROOT / "data" / "XAUUSD_daily.parquet"
 
