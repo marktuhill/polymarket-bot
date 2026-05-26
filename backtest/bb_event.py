@@ -66,8 +66,14 @@ def run_bb_backtest(
     risk_per_trade: float = 0.01,
     commission_bps: float = 2.0,
     starting_equity: float = 100_000.0,
+    regime_lookback: int | None = None,
+    regime_threshold: float = 0.25,
 ) -> tuple[pd.Series, list[Trade]]:
     """Run the strategy on a daily OHLC DataFrame indexed by date.
+
+    When ``regime_lookback`` is set, signals are skipped on bars where the
+    absolute rolling percentage change of close over that lookback exceeds
+    ``regime_threshold`` (i.e. the asset is trending too strongly to fade).
 
     Returns the equity curve (one value per bar, including pre-trade flat region)
     and the list of completed trades.
@@ -76,6 +82,12 @@ def run_bb_backtest(
     lower, mid, upper = bollinger_bands(df["close"], bb_period, bb_std)
     atr = atr_simple(df["high"], df["low"], df["close"], atr_period)
     df["lower"], df["mid"], df["upper"], df["atr"] = lower, mid, upper, atr
+
+    if regime_lookback is not None:
+        regime = df["close"].pct_change(regime_lookback).abs()
+        regime_ok = (regime < regime_threshold).to_numpy()
+    else:
+        regime_ok = np.ones(len(df), dtype=bool)
 
     o = df["open"].to_numpy()
     h = df["high"].to_numpy()
@@ -158,7 +170,7 @@ def run_bb_backtest(
                 units = 0.0
 
         # 3) Look for a new signal (only if flat with no pending entry).
-        if position == 0 and pending_entry is None and i >= warmup:
+        if position == 0 and pending_entry is None and i >= warmup and regime_ok[i]:
             crossed_below_lower = c[i - 1] >= lo_b[i - 1] and c[i] < lo_b[i]
             crossed_above_upper = c[i - 1] <= up_b[i - 1] and c[i] > up_b[i]
             if crossed_below_lower:
