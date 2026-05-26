@@ -7,3 +7,4 @@ data/*.parquet
 results/*.csv
 !results/.gitkeep
 !results/summary.csv
+!results/bb_xauusd_equity.png
