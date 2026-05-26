@@ -19,32 +19,21 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from backtest.bb_event import run_bb_backtest
-from backtest.crypto_ohlc import load_ohlc as load_crypto_ohlc
-from backtest.crypto_ohlc import load_ratio_ohlc
-from backtest.data import load_panel
-from backtest.engine import backtest as vec_backtest
+from backtest.candidates import collect_runs
 from backtest.portfolio import (
-    StrategyRun,
     align,
     equity_from_returns,
     metrics,
     rank_pairs,
+    rank_triplets,
     vol_scale,
 )
-from backtest.strategies import (
-    bb_mean_reversion,
-    donchian_breakout,
-    ema_cross,
-    ema_cross_long,
-    ema_cross_trailing_stop,
-)
-from backtest.xau_data import fetch_xauusd_daily
 
 START = "2020-01-01"
 TARGET_VOL = 0.10
 PLOT_PATH = ROOT / "results" / "best_pair_equity.png"
 PLOT_PATH_CROSS = ROOT / "results" / "best_pair_xau_crypto_equity.png"
+PLOT_PATH_TRIPLET = ROOT / "results" / "best_triplet_equity.png"
 
 
 def _plot_pair(a: str, b: str, corr: float, leg_a, leg_b, combined, path: Path, title_prefix: str) -> None:
@@ -63,52 +52,20 @@ def _plot_pair(a: str, b: str, corr: float, leg_a, leg_b, combined, path: Path, 
     plt.close(fig)
 
 
-def _bb_event_returns(label: str, df: pd.DataFrame, **kwargs) -> StrategyRun:
-    equity, _ = run_bb_backtest(df, **kwargs)
-    rets = equity.pct_change().fillna(0.0)
-    rets.name = label
-    return StrategyRun(label=label, returns=rets)
-
-
-def _vec_returns(label: str, df: pd.DataFrame, signal_fn) -> StrategyRun:
-    res = vec_backtest(df, signal_fn, asset=label, strategy_name="")
-    rets = res.returns.copy()
-    rets.index = df["date"].values
-    rets.name = label
-    return StrategyRun(label=label, returns=rets)
-
-
-def collect_runs() -> list[StrategyRun]:
-    runs: list[StrategyRun] = []
-
-    crypto_panel = load_panel(["BTC", "ETH", "LTC"], start=START)
-    for asset, df in crypto_panel.items():
-        runs.append(_vec_returns(f"EMACross/{asset}", df, ema_cross))
-        runs.append(_vec_returns(f"EMACrossTS/{asset}", df, ema_cross_trailing_stop))
-        runs.append(_vec_returns(f"BBvec/{asset}", df, bb_mean_reversion))
-
-    ltc_ohlc = load_crypto_ohlc("LTC", start=START)
-    btceth_ohlc = load_ratio_ohlc("BTC", "ETH", start=START)
-    runs.append(_bb_event_returns("BBevent/LTC", ltc_ohlc))
-    runs.append(_bb_event_returns("BBevent/BTC-ETH", btceth_ohlc))
-    runs.append(_bb_event_returns("BBevent/BTC-ETH+filter", btceth_ohlc, regime_lookback=100, regime_threshold=0.25))
-
-    xau = fetch_xauusd_daily()
-    xau = xau[xau.index >= pd.Timestamp(START)]
-    runs.append(_bb_event_returns("BBevent/XAU", xau))
-
-    xau_vec = xau[["open", "high", "low", "close"]].copy()
-    xau_vec["date"] = xau.index
-    xau_vec = xau_vec.reset_index(drop=True)
-    runs.append(_vec_returns("EMACross/XAU", xau_vec, ema_cross))
-    runs.append(_vec_returns("EMACrossTS/XAU", xau_vec, ema_cross_trailing_stop))
-    runs.append(_vec_returns("EMALong-50-100/XAU", xau_vec, lambda d: ema_cross_long(d, 50, 100)))
-    runs.append(_vec_returns("EMALong-50-200/XAU", xau_vec, lambda d: ema_cross_long(d, 50, 200)))
-    runs.append(_vec_returns("EMALong-20-50/XAU", xau_vec, lambda d: ema_cross_long(d, 20, 50)))
-    runs.append(_vec_returns("Donchian-20-10/XAU", xau_vec, lambda d: donchian_breakout(d, 20, 10)))
-    runs.append(_vec_returns("Donchian-55-20/XAU", xau_vec, lambda d: donchian_breakout(d, 55, 20)))
-
-    return runs
+def _plot_triplet(a, b, c, avg_corr, legs, combined, path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(11, 6))
+    for label, leg in legs.items():
+        ax.plot(equity_from_returns(leg).index, equity_from_returns(leg).values, alpha=0.7, label=f"{label} (vol-scaled)")
+    ax.plot(equity_from_returns(combined).index, equity_from_returns(combined).values, label="1/3 each combo", linewidth=2.5, color="black")
+    ax.set_title(f"Best triplet: {a}  +  {b}  +  {c}   (avg corr={avg_corr:+.2f})")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Equity ($)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
 
 
 def main() -> None:
@@ -202,6 +159,35 @@ def main() -> None:
                 print(f"  {key:<14} {ma:>12.2%} {mb:>12.2%} {mc:>12.2%}")
         _plot_pair(ca, cb, cw["corr"], leg_ca_scaled, leg_cb_scaled, combined_cross, PLOT_PATH_CROSS, "Best cross-asset pair (XAU + crypto)")
         print(f"\nSaved cross-asset equity curve: {PLOT_PATH_CROSS.relative_to(ROOT)}")
+
+    triplet_ranking = rank_triplets(frame, target_vol=TARGET_VOL, require_positive_legs=True)
+    if not triplet_ranking.empty:
+        print("\nTop 10 triplets by combined Sharpe (1/3 of each vol-scaled leg):")
+        ttop = triplet_ranking.head(10).copy()
+        for col in ("combined_ann_return", "combined_max_dd", "combined_total"):
+            ttop[col] = ttop[col].map(lambda x: f"{x:+.2%}")
+        ttop["combined_sharpe"] = ttop["combined_sharpe"].map(lambda x: f"{x:.2f}")
+        ttop["avg_corr"] = ttop["avg_corr"].map(lambda x: f"{x:+.2f}")
+        print(ttop.to_string(index=False))
+
+        tw = triplet_ranking.iloc[0]
+        ta, tb, tc = tw["leg_a"], tw["leg_b"], tw["leg_c"]
+        print(f"\n=== Best triplet: {ta}  +  {tb}  +  {tc} ===")
+        print(f"  avg pairwise correlation : {tw['avg_corr']:+.3f}")
+        legs_scaled = {ta: vol_scale(frame[ta], TARGET_VOL), tb: vol_scale(frame[tb], TARGET_VOL), tc: vol_scale(frame[tc], TARGET_VOL)}
+        combined_triplet = sum(legs_scaled.values()) / 3.0
+        print(f"\n  {'metric':<14} {'leg A':>12} {'leg B':>12} {'leg C':>12} {'1/3 each':>12}")
+        for key in ("total_return", "ann_return", "sharpe", "max_dd"):
+            ma = metrics(legs_scaled[ta])[key]
+            mb = metrics(legs_scaled[tb])[key]
+            mc = metrics(legs_scaled[tc])[key]
+            md = metrics(combined_triplet)[key]
+            if key == "sharpe":
+                print(f"  {key:<14} {ma:>12.2f} {mb:>12.2f} {mc:>12.2f} {md:>12.2f}")
+            else:
+                print(f"  {key:<14} {ma:>12.2%} {mb:>12.2%} {mc:>12.2%} {md:>12.2%}")
+        _plot_triplet(ta, tb, tc, tw["avg_corr"], legs_scaled, combined_triplet, PLOT_PATH_TRIPLET)
+        print(f"\nSaved triplet equity curve: {PLOT_PATH_TRIPLET.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":

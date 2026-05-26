@@ -89,3 +89,45 @@ def rank_pairs(
                 }
             )
     return pd.DataFrame(rows).sort_values("combined_sharpe", ascending=False).reset_index(drop=True)
+
+
+def rank_triplets(
+    frame: pd.DataFrame,
+    *,
+    target_vol: float = 0.10,
+    require_positive_legs: bool = True,
+) -> pd.DataFrame:
+    """Score every triplet: equal-weight combo Sharpe of vol-scaled legs."""
+    labels = list(frame.columns)
+    scaled = pd.DataFrame({lab: vol_scale(frame[lab], target_vol) for lab in labels})
+    if require_positive_legs:
+        candidates = [lab for lab in labels if metrics(scaled[lab])["total_return"] > 0]
+    else:
+        candidates = labels
+
+    rows = []
+    for i, a in enumerate(candidates):
+        for j in range(i + 1, len(candidates)):
+            b = candidates[j]
+            for k in range(j + 1, len(candidates)):
+                c = candidates[k]
+                combined = (scaled[a] + scaled[b] + scaled[c]) / 3.0
+                m = metrics(combined)
+                avg_corr = (
+                    frame[a].corr(frame[b])
+                    + frame[a].corr(frame[c])
+                    + frame[b].corr(frame[c])
+                ) / 3.0
+                rows.append(
+                    {
+                        "leg_a": a,
+                        "leg_b": b,
+                        "leg_c": c,
+                        "avg_corr": float(avg_corr),
+                        "combined_sharpe": m["sharpe"],
+                        "combined_ann_return": m["ann_return"],
+                        "combined_max_dd": m["max_dd"],
+                        "combined_total": m["total_return"],
+                    }
+                )
+    return pd.DataFrame(rows).sort_values("combined_sharpe", ascending=False).reset_index(drop=True)
