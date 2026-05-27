@@ -17,7 +17,9 @@ from backtest.strategies import ema_cross, ema_cross_long
 
 BARS_PER_YEAR = 365
 ROLLING_WINDOW = 180
-TARGET_VOL = 0.10
+TARGET_VOL = 0.14  # per-leg ann vol target; combined ~8% under empirical correlations
+MAX_NOTIONAL_PCT_PER_LEG = 1.0  # hard cap: no leg can exceed 100% of its equity allocation
+BBEVENT_RISK_PER_TRADE = 0.015  # per-trade risk on BBevent/LTC; ~$500 max loss per trade on $100k
 
 
 @dataclass
@@ -44,7 +46,7 @@ def _btc_signal(btc_df: pd.DataFrame) -> tuple[int, pd.Series, float]:
 
 
 def _ltc_signal(ltc_ohlc: pd.DataFrame) -> tuple[int, pd.Series, float]:
-    eq, _, positions = run_bb_backtest(ltc_ohlc)
+    eq, _, positions = run_bb_backtest(ltc_ohlc, risk_per_trade=BBEVENT_RISK_PER_TRADE)
     rets = eq.pct_change().fillna(0.0)
     pos = int(positions.iloc[-1])
     last_price = float(ltc_ohlc["close"].iloc[-1])
@@ -111,12 +113,15 @@ def compute_signals(
         active_count = 1  # avoid division by zero; everything muted -> flat anyway
 
     per_leg_equity = equity_usd / active_count
+    notional_cap = MAX_NOTIONAL_PCT_PER_LEG * per_leg_equity
     signals: list[LegSignal] = []
     for name, asset, pos, rets, last_price in legs_raw:
         sharpe = _rolling_sharpe(rets)
         is_active = (not drop_negative_sharpe) or sharpe > 0
         vs = _rolling_vol_scale(rets) if is_active else 0.0
         notional = pos * vs * per_leg_equity
+        if abs(notional) > notional_cap:
+            notional = notional_cap if notional > 0 else -notional_cap
         units = notional / last_price if last_price > 0 else 0.0
         signals.append(
             LegSignal(
