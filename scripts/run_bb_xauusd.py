@@ -51,8 +51,8 @@ def main() -> None:
     print(f"  train: {len(train_df)} bars, {train_df.index.min().date()} -> {train_df.index.max().date()}")
     print(f"  test : {len(test_df)} bars, {test_df.index.min().date()} -> {test_df.index.max().date()}")
 
-    train_eq, train_trades = run_bb_backtest(train_df)
-    test_eq, test_trades = run_bb_backtest(test_df)
+    train_eq, train_trades, _ = run_bb_backtest(train_df)
+    test_eq, test_trades, _ = run_bb_backtest(test_df)
 
     _print_metrics("TRAIN 2020-2022", metrics(train_eq, train_trades))
     _print_metrics(f"TEST {TEST_START[:4]}-{test_df.index.max().year}", metrics(test_eq, test_trades))

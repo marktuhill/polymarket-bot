@@ -81,7 +81,7 @@ def collect_returns() -> dict[str, pd.Series]:
     ).rename("BH-1/3-BTC-ETH-XAU")
 
     ltc_ohlc = load_crypto_ohlc("LTC", start=START)
-    eq_ltc, _ = run_bb_backtest(ltc_ohlc)
+    eq_ltc, _, _ = run_bb_backtest(ltc_ohlc)
     out["STRAT-BBevent/LTC"] = _trim(eq_ltc.pct_change())
 
     xv = xau[["open", "high", "low", "close"]].copy()

@@ -24,7 +24,7 @@ from backtest.xau_data import fetch_xauusd_daily
 
 
 def _bb_event_returns(label: str, df: pd.DataFrame, **kwargs) -> StrategyRun:
-    equity, _ = run_bb_backtest(df, **kwargs)
+    equity, _, _ = run_bb_backtest(df, **kwargs)
     rets = equity.pct_change().fillna(0.0)
     rets.name = label
     return StrategyRun(label=label, returns=rets)

@@ -53,7 +53,7 @@ def _train_vol_scale(r: pd.Series, train: pd.Series, target: float = TARGET_VOL)
 
 
 def _bb_returns(ltc_ohlc: pd.DataFrame, **kwargs) -> pd.Series:
-    eq, _ = run_bb_backtest(ltc_ohlc, **kwargs)
+    eq, _, _ = run_bb_backtest(ltc_ohlc, **kwargs)
     return eq.pct_change().fillna(0.0)
 
 

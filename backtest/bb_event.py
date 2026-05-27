@@ -68,15 +68,16 @@ def run_bb_backtest(
     starting_equity: float = 100_000.0,
     regime_lookback: int | None = None,
     regime_threshold: float = 0.25,
-) -> tuple[pd.Series, list[Trade]]:
+) -> tuple[pd.Series, list[Trade], pd.Series]:
     """Run the strategy on a daily OHLC DataFrame indexed by date.
 
     When ``regime_lookback`` is set, signals are skipped on bars where the
     absolute rolling percentage change of close over that lookback exceeds
     ``regime_threshold`` (i.e. the asset is trending too strongly to fade).
 
-    Returns the equity curve (one value per bar, including pre-trade flat region)
-    and the list of completed trades.
+    Returns (equity_series, completed_trades, position_series). The position
+    series records the strategy's net direction at the close of each bar,
+    valued in {-1, 0, +1}.
     """
     df = df.copy()
     lower, mid, upper = bollinger_bands(df["close"], bb_period, bb_std)
@@ -101,6 +102,7 @@ def run_bb_backtest(
 
     equity = starting_equity
     equity_series = np.full(len(df), starting_equity, dtype=float)
+    position_series = np.zeros(len(df), dtype=int)
     trades: list[Trade] = []
 
     position = 0
@@ -181,8 +183,11 @@ def run_bb_backtest(
                 entry_atr = atr_v[i]
 
         equity_series[i] = equity
+        position_series[i] = position
 
-    return pd.Series(equity_series, index=df.index, name="equity"), trades
+    eq = pd.Series(equity_series, index=df.index, name="equity")
+    pos = pd.Series(position_series, index=df.index, name="position")
+    return eq, trades, pos
 
 
 def metrics(equity: pd.Series, trades: list[Trade]) -> dict:

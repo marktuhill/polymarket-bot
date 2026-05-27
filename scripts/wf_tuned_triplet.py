@@ -61,7 +61,7 @@ def _trim(s: pd.Series) -> pd.Series:
 
 
 def _bb_returns(ohlc: pd.DataFrame, **kwargs) -> pd.Series:
-    eq, _ = run_bb_backtest(ohlc, **kwargs)
+    eq, _, _ = run_bb_backtest(ohlc, **kwargs)
     return eq.pct_change().fillna(0.0)
 
 

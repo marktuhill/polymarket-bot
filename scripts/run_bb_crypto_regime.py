@@ -29,7 +29,7 @@ PLOT_PATH = ROOT / "results" / "bb_crypto_regime_equity.png"
 
 
 def _run(label: str, df: pd.DataFrame, *, regime: bool):
-    eq, trades = run_bb_backtest(
+    eq, trades, _ = run_bb_backtest(
         df,
         regime_lookback=REGIME_LOOKBACK if regime else None,
         regime_threshold=REGIME_THRESHOLD,

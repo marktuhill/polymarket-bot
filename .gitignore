@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 data/*.csv
 data/*.parquet
+data/live_state.json
+data/bot.log
 !data/.gitkeep
 results/*.csv
 !results/.gitkeep
