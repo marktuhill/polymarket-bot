@@ -111,7 +111,7 @@ import math
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 
 import requests
@@ -649,6 +649,12 @@ def _futures_perp_universe(client):
         if sym_info.get("contractType") != "PERPETUAL":
             continue
         symbol = sym_info.get("symbol")
+        # Binance returns ASCII symbols (e.g. BTCUSDT). Defensive guard: skip
+        # anything non-ASCII so localized/display names can never leak into
+        # logs, CSV, or Telegram messages.
+        if not symbol or not symbol.isascii():
+            logger.warning("Skipping non-ASCII futures symbol from exchangeInfo: %r", symbol)
+            continue
         for flt in sym_info.get("filters", []):
             if flt.get("filterType") == "PRICE_FILTER":
                 tick = flt.get("tickSize", "0")
@@ -676,6 +682,11 @@ def refresh_pairs(state, client, config):
     candidates = []
     for row in data:
         symbol = row.get("symbol", "")
+        # Same ASCII guard as the exchangeInfo path: keep only ASCII symbols
+        # so non-ASCII memecoin tickers never end up in alerts/state/CSV.
+        if not symbol or not symbol.isascii():
+            logger.warning("Skipping non-ASCII ticker symbol from 24hr feed: %r", symbol)
+            continue
         if not symbol.endswith("USDT"):
             continue
         # Restrict to live perpetuals when we have the universe; otherwise the
@@ -926,9 +937,56 @@ def _append_alert_row(row):
         csv.DictWriter(fh, fieldnames=CSV_HEADER).writerow(row)
 
 
+def _recent_duplicate_alert_ts(symbol, direction, entry, stop, target, atr,
+                               window_hours=48):
+    """Return the timestamp string of a recent alert that matches this one's
+    pair+direction with entry/stop/target all within +-0.5*ATR. Returns None
+    if no duplicate was logged in the last ``window_hours``. Sits on top of
+    the midline re-arm so that even a clean re-arm of the same level can't
+    re-fire if the structural levels barely moved."""
+    if not os.path.isfile(ALERTS_CSV) or not atr or atr <= 0:
+        return None
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    tol = 0.5 * atr
+    try:
+        with open(ALERTS_CSV, "r", newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                if row.get("pair") != symbol or row.get("direction") != direction:
+                    continue
+                try:
+                    ts = datetime.strptime(row["timestamp"],
+                                           "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                except (KeyError, ValueError):
+                    continue
+                if ts < cutoff:
+                    continue
+                try:
+                    if (abs(float(row["entry"]) - entry) <= tol
+                            and abs(float(row["stop"]) - stop) <= tol
+                            and abs(float(row["target"]) - target) <= tol):
+                        return row["timestamp"]
+                except (KeyError, TypeError, ValueError):
+                    continue
+    except OSError as exc:
+        logger.warning("Could not read alert CSV for dedup check: %s", exc)
+    return None
+
+
 def _emit_alert(symbol, side, rng, current, config, ticks, notifier, dry_run):
+    direction, entry, stop, target, _rr = _order_levels(side, rng, config)
+
+    dup_ts = _recent_duplicate_alert_ts(symbol, direction, entry, stop, target,
+                                        rng.get("atr", 0))
+    if dup_ts:
+        logger.info("Suppressed alert %s %s (entry=%s stop=%s target=%s): "
+                    "duplicate of %s",
+                    symbol, direction,
+                    fmt_price(entry, symbol, ticks),
+                    fmt_price(stop, symbol, ticks),
+                    fmt_price(target, symbol, ticks), dup_ts)
+        return
+
     message = build_alert_message(symbol, side, rng, current, config, ticks)
-    direction = "BUY AT SUPPORT" if side == "support" else "SELL AT RESISTANCE"
     logger.info("ALERT %s %s (close=%s)", symbol, direction, fmt_price(current, symbol, ticks))
     if dry_run:
         print("\n[TEST] Would send Telegram alert:\n" + message)
