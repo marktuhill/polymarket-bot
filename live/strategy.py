@@ -17,9 +17,9 @@ from backtest.strategies import ema_cross, ema_cross_long
 
 BARS_PER_YEAR = 365
 ROLLING_WINDOW = 180
-TARGET_VOL = 0.14  # per-leg ann vol target; combined ~8% under empirical correlations
-MAX_NOTIONAL_PCT_PER_LEG = 1.0  # hard cap: no leg can exceed 100% of its equity allocation
-BBEVENT_RISK_PER_TRADE = 0.015  # per-trade risk on BBevent/LTC; ~$500 max loss per trade on $100k
+TARGET_VOL = 0.14  # per-leg ann vol target before clipping
+MAX_NOTIONAL_PCT_OF_EQUITY = 0.02  # hard cap: no single leg's notional > 2% of TOTAL equity
+BBEVENT_RISK_PER_TRADE = 0.005  # 0.5% of leg equity at stop; capped further by notional cap
 
 
 @dataclass
@@ -113,7 +113,7 @@ def compute_signals(
         active_count = 1  # avoid division by zero; everything muted -> flat anyway
 
     per_leg_equity = equity_usd / active_count
-    notional_cap = MAX_NOTIONAL_PCT_PER_LEG * per_leg_equity
+    notional_cap = MAX_NOTIONAL_PCT_OF_EQUITY * equity_usd  # cap is % of TOTAL equity per leg
     signals: list[LegSignal] = []
     for name, asset, pos, rets, last_price in legs_raw:
         sharpe = _rolling_sharpe(rets)
