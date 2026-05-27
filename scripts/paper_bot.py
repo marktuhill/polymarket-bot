@@ -20,12 +20,15 @@ from live.state import BotState
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Daily paper-trading runner.")
-    parser.add_argument("--starting-equity", type=float, default=100_000.0, help="Used only on first run when state file is empty.")
+    parser = argparse.ArgumentParser(description="Daily trading runner (paper or MT5).")
+    parser.add_argument("--broker", choices=["paper", "mt5"], default="paper",
+                        help="paper = in-process simulator (default); mt5 = live IC Markets / any MT5 broker (Windows only).")
+    parser.add_argument("--starting-equity", type=float, default=100_000.0,
+                        help="Paper-broker initial cash; ignored for mt5.")
     parser.add_argument("--force", action="store_true", help="Run even if already executed today.")
     parser.add_argument("--reset", action="store_true", help="Wipe persisted state and start fresh.")
-    parser.add_argument("--slippage-bps", type=float, default=10.0, help="One-sided slippage in basis points.")
-    parser.add_argument("--commission-bps", type=float, default=10.0, help="One-sided commission in basis points.")
+    parser.add_argument("--slippage-bps", type=float, default=10.0, help="Paper broker slippage (per side).")
+    parser.add_argument("--commission-bps", type=float, default=10.0, help="Paper broker commission (per side).")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -41,12 +44,17 @@ def main() -> None:
     if not state.equity_history:
         state.cash_usd = args.starting_equity
 
-    broker = PaperBroker(
-        cash_usd=state.cash_usd,
-        slippage_bps=args.slippage_bps,
-        commission_bps=args.commission_bps,
-        positions=dict(state.positions),
-    )
+    if args.broker == "mt5":
+        from live.adapters.mt5_broker import MT5Broker
+
+        broker = MT5Broker()
+    else:
+        broker = PaperBroker(
+            cash_usd=state.cash_usd,
+            slippage_bps=args.slippage_bps,
+            commission_bps=args.commission_bps,
+            positions=dict(state.positions),
+        )
 
     result = run_once(broker, state, force=args.force)
     state.save()

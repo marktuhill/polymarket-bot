@@ -50,31 +50,104 @@ only run paper here against historical data — useful for validating logic, not
 for true forward paper trading. Run it on your local machine or a VPS for
 genuine paper / live deployment.
 
-## Going from paper to a real exchange
+## Going live on IC Markets MT5 (Windows)
 
-`live/broker.py` defines the `Broker` interface. `PaperBroker` is the default
-in-process simulator (fills at next bar's price ± slippage_bps; commission
-per side). To trade against a real venue, subclass `Broker`:
+All three legs trade as CFDs on a single IC Markets MT5 account — `BTCUSD`,
+`LTCUSD`, `XAUUSD`. Raw Spread account is recommended for tighter spreads on
+crypto.
 
-```python
-class BinanceSpotTestnetBroker(Broker):
-    def __init__(self, api_key: str, api_secret: str): ...
-    def get_positions(self) -> dict[str, float]: ...
-    def get_equity(self, mark_prices: dict[str, float]) -> float: ...
-    def submit_order(self, asset, units, price_hint, timestamp) -> Fill: ...
+### One-time setup
+
+1. **Install MT5** and log into your IC Markets demo (or live) account.
+2. **Enable the symbols.** Market Watch -> Show All, then right-click and add
+   `BTCUSD`, `LTCUSD`, `XAUUSD` if they aren't already visible.
+3. **Install the Python bridge** (Python 3.9-3.12 on Windows):
+   ```
+   pip install MetaTrader5
+   ```
+4. **Set credentials** as environment variables — never as CLI flags or in
+   files committed to git:
+   ```
+   setx MT5_LOGIN 12345678
+   setx MT5_PASSWORD "your-mt5-password"
+   setx MT5_SERVER "ICMarketsSC-Demo"
+   ```
+   The server name appears in MT5 (Tools -> Options -> Server). For live
+   accounts it's typically `ICMarkets-Live01` or similar.
+5. **Close any conflicting EAs** on the same symbols, or use a separate MT5
+   account. The bot only touches positions with magic `19850528`, so it
+   coexists with manual trades, but two strategies fighting for the same
+   symbol is a bad idea.
+
+### Run it
+
+```
+python scripts/paper_bot.py --broker mt5
 ```
 
-Recommended starting venues for this triplet:
+The MT5 terminal must be running and logged in when this executes. The bot
+will fail loudly if credentials are missing, symbols aren't enabled, or the
+terminal isn't responding.
 
-| Leg  | Exchange (paper)                      | API docs                                                      |
-| ---- | ------------------------------------- | ------------------------------------------------------------- |
-| BTC  | Binance Spot Testnet                  | https://testnet.binance.vision/                               |
-| LTC  | Binance Spot Testnet (spot + margin)  | same — LTC/USDT margin is needed for the short side           |
-| XAU  | OANDA fxTrade Practice                | https://developer.oanda.com/rest-live-v20/introduction/       |
+### What the adapter does
 
-LTC shorts on Binance margin incur funding/borrow cost (often 0.02-0.10% per
-day in normal regimes, spiking higher in stress). The backtest does **not**
-model this — expect 2-5% annualised drag once live.
+`live/adapters/mt5_broker.py` (`MT5Broker`):
+- Initialises the MT5 terminal connection using env vars
+- Queries `symbol_info` for `trade_contract_size`, `volume_min`, `volume_step`
+  to convert between strategy "units" (asset units) and MT5 "lots"
+- Aggregates `positions_get(symbol=...)` filtered by magic into signed unit
+  exposure per asset
+- Sends market orders via `TRADE_ACTION_DEAL` with `ORDER_FILLING_IOC` and
+  `deviation=50` points
+- Reads live equity from `account_info().equity`
+
+### IC Markets specifics
+
+| Symbol | Contract size | Min volume | Typical spread (RS) | Notes                          |
+| ------ | ------------- | ---------- | ------------------- | ------------------------------ |
+| BTCUSD | 1 BTC         | 0.01 lot   | $5-30 (~5-40 bps)   | Swap charged both sides        |
+| LTCUSD | 1 LTC         | 1 lot      | $0.05-0.30 (~50 bps)| Min size 1 LTC is the constraint for short legs |
+| XAUUSD | 100 oz        | 0.01 lot   | 1.5-3.0 pips (~5 bps)| Long swap ~-4%/yr, short swap usually positive |
+
+Watch out for **LTCUSD min size = 1 LTC**: at ~$80/LTC, a $5 dust trade
+wouldn't fire on a $100k account either way, but at <$10k account size you
+may not be able to position-size LTC precisely.
+
+### Fees, swaps, what the backtest doesn't model
+
+| Friction        | Estimate           | Where it bites                            |
+| --------------- | ------------------ | ----------------------------------------- |
+| Spread          | 5-50 bps round-trip| Every rebalance                           |
+| Commission (RS) | ~6 bps round-trip  | Every rebalance                           |
+| BTC/LTC swap    | ±20-100 bps/day    | Both sides; punishing on overnight shorts |
+| XAU long swap   | ~-4% annualised    | When EMALong/XAU is in the market         |
+
+Cumulative drag: **3-7% annualised** off the backtest's +10.4%.
+Realistic live target: 3-7% annual return, Sharpe 1.0-1.4.
+
+### Schedule it (Windows Task Scheduler)
+
+Create a daily task triggering:
+
+```
+Program:    C:\Python311\python.exe
+Arguments:  scripts\paper_bot.py --broker mt5
+Start in:   C:\path\to\polymarket-bot
+```
+
+Recommended trigger: daily at 23:30 UTC (around the daily candle close on
+most brokers; check your broker's server time).
+
+### Sanity checks before going live
+
+1. Run on demo for at least 4 weeks. Daily-diff the bot's equity against
+   `python scripts/wf_tuned_triplet.py` — drift > 1% over 30 days means
+   your fee/swap model is wrong.
+2. Verify the kill switch works by manually editing `data/live_state.json`
+   to set `kill_switch_tripped: true`, then running the bot — it should
+   flatten all positions and refuse to re-enter.
+3. Verify your magic number is unique — `mt5.positions_get()` should return
+   nothing other than your bot's positions when filtered by magic.
 
 ## Drift monitoring
 
