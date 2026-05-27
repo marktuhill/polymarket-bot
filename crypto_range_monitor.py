@@ -1658,6 +1658,9 @@ def parse_args():
     parser.add_argument("--experiment", action="store_true",
                         help="Sweep stop x target exit rules over the logged "
                              "alerts to look for higher win rate / expectancy.")
+    parser.add_argument("--csv", default=None,
+                        help="Override the alerts CSV path used by --review "
+                             "and --experiment (default: crypto_range_alerts.csv).")
     return parser.parse_args()
 
 
@@ -1666,6 +1669,11 @@ def main():
     setup_logging()
     load_env_file(ENV_FILE)
     config = get_config()
+
+    if args.csv:
+        global ALERTS_CSV
+        ALERTS_CSV = os.path.abspath(args.csv)
+        logger.info("Using alerts CSV: %s", ALERTS_CSV)
 
     if args.status:
         print_ranges(load_state())
