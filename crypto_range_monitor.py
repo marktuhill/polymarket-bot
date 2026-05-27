@@ -980,11 +980,13 @@ def run_alert_check(state, client, config, notifier, dry_run=False):
         proximity = config["alert_atr_mult"] * rng["atr"]
         sup = rng["support"]
         res = rng["resistance"]
+        midline = (sup + res) / 2.0
         side = evaluate_alert(close, rng, config)
 
         # Bounce off support -> buy. Fire only if armed AND past the per-level
-        # cooldown (stops the same level chopping out repeated alerts). Re-arm
-        # once price leaves the band.
+        # cooldown. Re-arm only after price has reclaimed the range midpoint
+        # since the alert -- a true round-trip across the box, not a small
+        # chop-out that would re-fire the same level all day.
         if side == "support":
             cooled = now_ts - rng.get("alerted_support_ts", 0) >= cooldown
             if not rng.get("alerted_support") and cooled:
@@ -992,10 +994,10 @@ def run_alert_check(state, client, config, notifier, dry_run=False):
                 rng["alerted_support"] = True
                 rng["alerted_support_ts"] = now_ts
                 fired += 1
-        elif abs(close - sup) > 1.5 * proximity:
+        elif close >= midline:
             rng["alerted_support"] = False
 
-        # Rejection at resistance -> sell.
+        # Rejection at resistance -> sell. Same midline re-arm rule.
         if side == "resistance":
             cooled = now_ts - rng.get("alerted_resistance_ts", 0) >= cooldown
             if not rng.get("alerted_resistance") and cooled:
@@ -1003,7 +1005,7 @@ def run_alert_check(state, client, config, notifier, dry_run=False):
                 rng["alerted_resistance"] = True
                 rng["alerted_resistance_ts"] = now_ts
                 fired += 1
-        elif abs(close - res) > 1.5 * proximity:
+        elif close <= midline:
             rng["alerted_resistance"] = False
 
     logger.info("Alert check complete: %d pair(s) checked, %d alert(s)", checked, fired)
