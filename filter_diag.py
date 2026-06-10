@@ -12,6 +12,19 @@ No sweeps, no tuning. Predictions stated in advance:
   F3 (HTF trend alignment): trend-aligned trades (BUY when price above D1
     EMA50, SELL when below) outperform counter-trend trades.
 
+AMENDED 2026-06-10: F1 stop geometry and F2 touch counting were measurement
+bugs -- definitions corrected before any forward data accumulated. Predictions
+unchanged.
+  F1 fix: confirmed trades now use IDENTICAL stop/target geometry to
+    unconfirmed (anchored to the original zone-boundary entry). Only the fill
+    price changes (open of the bar after the rejection candle). Report both
+    (i) win-rate at the shared stop/target, and (ii) realized expectancy at the
+    actual fill, so the A/B is purely about whether rejection predicts
+    resolution -- not about whether a tiny stop near support survives.
+  F2 fix: replace the naive per-bar tally with the LIVE detector's
+    _genuine_touches over swing pivots (cluster tol = zone_atr_mult * ATR), so a
+    multi-bar visit counts as one touch, matching the production semantics.
+
 Acceptance rule: a filter is only accepted if its predicted direction holds on
 FORWARD data (trades timestamped after 2026-06-10) at the next two checkpoints.
 Results on the existing trades are IN-SAMPLE and hypothesis-generating only.
@@ -175,32 +188,52 @@ def f1_check_rejection(client, t):
 
 
 # ---- F2: touch count at alert ---------------------------------------------
-def f2_count_touches(client, t):
-    """Number of 4H bars in the F2_LOOKBACK_BARS_4H window before the alert
-    where the relevant zone (support for BUY, resistance for SELL) was reached
-    within +-F2_TOUCH_TOL_ATR*ATR. Returns None if 4H history is unavailable."""
+# AMENDED 2026-06-10: replace per-bar count with the live detector's swing-
+# cluster touch counter. Reuse crm.find_swings + crm._genuine_touches verbatim.
+def f2_count_touches(client, t, config):
+    """Genuine touches of the traded zone (support for BUY, resistance for SELL)
+    in the F2_LOOKBACK_BARS_4H window before the alert, using the LIVE detector
+    (crm.find_swings + crm._genuine_touches). Returns None if history short."""
     pair, is_buy = t["pair"], t["is_buy"]
     level, atr, ts_ms = t["level"], t["atr"], t["ts_ms"]
     if level != level:
         return None
     start_ms = ts_ms - F2_LOOKBACK_BARS_4H * MS_4H
-    bars = crm._fetch_klines_from(client, pair, "4h",
-                                  start_ms, F2_LOOKBACK_BARS_4H + 5)
-    if not bars:
+    raw = crm._fetch_klines_from(client, pair, "4h",
+                                 start_ms, F2_LOOKBACK_BARS_4H + 5)
+    if not raw:
         return None
-    tol = F2_TOUCH_TOL_ATR * atr
-    count = 0
-    for b in bars:
+    # Trim to bars strictly before the alert and convert to live's (h,l,c) format
+    # (matches BinanceClient.get_klines output that detect_range consumes).
+    bars = []
+    for b in raw:
         if int(b[0]) >= ts_ms:
             break
-        hi, lo = float(b[2]), float(b[3])
-        if is_buy:
-            if lo <= level + tol:
-                count += 1
-        else:
-            if hi >= level - tol:
-                count += 1
-    return count
+        try:
+            bars.append((float(b[2]), float(b[3]), float(b[4])))
+        except (IndexError, TypeError, ValueError):
+            continue
+    if len(bars) < 2 * config["swing_strength"] + 1:
+        return None
+    # Touch tolerance matches the live zone tolerance, NOT F2_TOUCH_TOL_ATR --
+    # use whatever config["zone_atr_mult"] says, so cluster + walk-off semantics
+    # are identical to detect_range. F2_TOUCH_TOL_ATR is retained as a pre-reg
+    # constant on the assumption it matched; in practice both are 0.5xATR.
+    tol = config["zone_atr_mult"] * atr
+    kind = "low" if is_buy else "high"
+    pivots = crm.find_swings(bars, config["swing_strength"], kind)
+    if not pivots:
+        return 0
+    # Find the swing cluster whose mean is closest to the alert's actual zone
+    # level (so we count touches of THIS support/resistance, not some other one).
+    clusters = crm.cluster_levels(pivots, tol)
+    if not clusters:
+        return 0
+    near = [c for c in clusters if abs(crm._cluster_mean(c) - level) <= tol]
+    target_cluster = (min(near, key=lambda c: abs(crm._cluster_mean(c) - level))
+                      if near else
+                      min(clusters, key=lambda c: abs(crm._cluster_mean(c) - level)))
+    return crm._genuine_touches(target_cluster, bars, tol, kind)
 
 
 # ---- F3: HTF trend (D1 EMA50) ---------------------------------------------
@@ -237,20 +270,31 @@ def f3_trend_alignment(client, t):
 
 
 # ---- metrics ---------------------------------------------------------------
-def metrics(trades, S, T, entry_key="entry", seg_key="seg"):
+def metrics(trades, S, T, entry_key="entry", seg_key="seg", anchor_key=None):
     """Win/loss/R count at one (stop, target) cell. Mirrors run_experiment:
-    expectancy denominator is resolved (win+loss); opens excluded."""
+    expectancy denominator is resolved (win+loss); opens excluded.
+
+    `anchor_key` (optional): when set, stop and target are anchored to
+    t[anchor_key] (the ORIGINAL zone-boundary entry), while the segment used
+    for resolution and the fill price come from `entry_key`/`seg_key`. This is
+    the F1 fix: identical stop/target geometry for confirmed vs unconfirmed,
+    so the A/B isolates the filter from stop placement. Realized R per win is
+    measured from the actual fill price (entry_key), so a confirmed trade that
+    fills above support harvests fewer R to the same target -- that's the cost
+    of waiting for the rejection, and we want to see it."""
     w = l = opn = 0
     tr = 0.0
     for t in trades:
         is_buy, atr = t["is_buy"], t["atr"]
         entry, seg = t[entry_key], t[seg_key]
-        stop = entry - S * atr if is_buy else entry + S * atr
+        anchor = t[anchor_key] if anchor_key else entry
+        stop = anchor - S * atr if is_buy else anchor + S * atr
         risk = S * atr
-        tgt = entry + T * atr if is_buy else entry - T * atr
+        tgt = anchor + T * atr if is_buy else anchor - T * atr
         res = crm._resolve_seg(seg, is_buy, stop, tgt)
         if res == "win":
             w += 1
+            # Realized R = distance from actual fill to target / risk (1R).
             tr += abs(tgt - entry) / risk if risk else 0.0
         elif res == "loss":
             l += 1
@@ -313,13 +357,24 @@ def main():
         return
 
     # ----------------------- F1 -----------------------
+    # AMENDED 2026-06-10: confirmed trades now use IDENTICAL stop/target
+    # geometry (anchored to the original zone-boundary entry). Only the fill
+    # price differs. Report (i) win-rate at shared stop/target, then (ii)
+    # realized expectancy (uses actual fill, so shorter R-to-target on confirmed
+    # wins is captured as the cost of waiting for confirmation).
     print(f"\n=== F1 (1H rejection confirmation) [{sample}] ===")
     print(f"  window={F1_REJECT_WINDOW_BARS_1H}x1H  "
           f"penetration<={F1_PENETRATION_ATR}xATR  "
           f"wick>={F1_WICK_FRACTION*100:.0f}% of range")
+    print("  geometry: confirmed/unconfirmed share stop/target anchored to "
+          "original entry; confirmed fill = open after rejection candle.")
     confirmed, unconfirmed = [], []
     for t in trades:
         ok, ne, ns = f1_check_rejection(client, t)
+        # Store the original entry so confirmed trades can anchor stop/target
+        # to it (identical geometry) even when the fill is the post-rejection
+        # bar's open.
+        t["orig_entry"] = t["entry"]
         if ok:
             t["f1_entry"], t["f1_seg"] = ne, ns
             confirmed.append(t)
@@ -329,25 +384,31 @@ def main():
           f"unconfirmed={len(unconfirmed)}")
     for (S, T) in CELLS:
         print(f"  @ {S}/{T}:")
-        mc = metrics(confirmed, S, T, entry_key="f1_entry", seg_key="f1_seg")
+        mc = metrics(confirmed, S, T, entry_key="f1_entry",
+                     seg_key="f1_seg", anchor_key="orig_entry")
         mu = metrics(unconfirmed, S, T)
         print(_row(f"confirmed [{sample}]", mc))
         print(_row(f"unconfirmed [{sample}]", mu))
         print(f"  by direction @ {S}/{T}:")
         for dc, isbuy in (("BUY", True), ("SELL", False)):
             mc = metrics([t for t in confirmed if t["is_buy"] == isbuy],
-                         S, T, entry_key="f1_entry", seg_key="f1_seg")
+                         S, T, entry_key="f1_entry",
+                         seg_key="f1_seg", anchor_key="orig_entry")
             mu = metrics([t for t in unconfirmed if t["is_buy"] == isbuy], S, T)
             print(_row(f"confirmed {dc}", mc))
             print(_row(f"unconfirmed {dc}", mu))
 
     # ----------------------- F2 -----------------------
+    # AMENDED 2026-06-10: reuse the live detector's swing-cluster touch counter
+    # (crm._genuine_touches) instead of a per-bar tally, so a multi-bar visit
+    # counts as one touch -- matches production semantics.
     print(f"\n=== F2 (touch count at alert) [{sample}] ===")
     print(f"  lookback={F2_LOOKBACK_BARS_4H}x4H  "
-          f"tolerance=+-{F2_TOUCH_TOL_ATR}xATR")
+          f"tol={config['zone_atr_mult']}xATR (live zone tol)  "
+          f"swing_strength={config['swing_strength']}")
     missing = 0
     for t in trades:
-        tc = f2_count_touches(client, t)
+        tc = f2_count_touches(client, t, config)
         t["touches"] = tc
         if tc is None:
             missing += 1
