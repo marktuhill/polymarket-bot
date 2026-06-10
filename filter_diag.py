@@ -358,6 +358,17 @@ def main():
     b4 = [t for t in trades if t["touches"] is not None and t["touches"] >= 4]
     print(f"  buckets: touches<=2 n={len(b2)}  touches=3 n={len(b3)}  "
           f"touches>=4 n={len(b4)}")
+    # Raw distribution under the CURRENT (per-bar) touch definition. Diagnostic
+    # only -- helps tell whether the buckets need redefining or just a different
+    # touch counter (e.g. swing-cluster as in the live detector).
+    raw = [t["touches"] for t in trades if t["touches"] is not None]
+    if raw:
+        hist = {}
+        for c in raw:
+            hist[c] = hist.get(c, 0) + 1
+        print("  raw touch-count distribution (current definition):")
+        for c in sorted(hist):
+            print(f"    {c:>3} |  {'#'*hist[c]} ({hist[c]})")
     for (S, T) in CELLS:
         print(f"  @ {S}/{T}:")
         print(_row(f"touches<=2 [{sample}]", metrics(b2, S, T)))
