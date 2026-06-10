@@ -25,6 +25,13 @@ unchanged.
     _genuine_touches over swing pivots (cluster tol = zone_atr_mult * ATR), so a
     multi-bar visit counts as one touch, matching the production semantics.
 
+AMENDED 2026-06-10 (F3 / regime): F3 prediction (aligned > counter) is retained
+  and on track for rejection. NEW hypothesis F3' registered before forward
+  data: counter-trend trades (BUY below D1 EMA50, SELL above D1 EMA50)
+  outperform aligned trades. F3' must hold on forward data at the next two
+  checkpoints to be accepted. The short-regime tag is retired as an independent
+  signal (83% overlap with F3-aligned).
+
 Acceptance rule: a filter is only accepted if its predicted direction holds on
 FORWARD data (trades timestamped after 2026-06-10) at the next two checkpoints.
 Results on the existing trades are IN-SAMPLE and hypothesis-generating only.
