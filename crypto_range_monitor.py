@@ -133,6 +133,20 @@ PAIR_REFRESH_INTERVAL = 24 * 60 * 60  # 24 hours
 DETECT_DELAY = 30                 # wait this long after bar close before pulling
 MAX_SLEEP = 120                   # never sleep longer than this between wakes
 
+# --------------------------------------------------------------------------- #
+# Cost model (additive; used only by --experiment for net expectancy)
+# --------------------------------------------------------------------------- #
+# Per-trade round-trip cost as a fraction of entry PRICE (0.001 = 0.1%).
+# Default covers round-trip taker fee + base slippage. Override with
+# --cost FLOAT (e.g. --cost 0.0015). Charged once per trade (win OR loss).
+#
+#   cost_R = (COST_PCT * entry_price) / (S * ATR)
+#
+# Computed per-trade from that trade's actual entry and the cell's stop
+# multiple S, so tight-stop cells (small S) carry a much larger toll than
+# wide-stop cells. That asymmetry is the entire point of the net matrix.
+COST_PCT = 0.001
+
 CSV_HEADER = ["timestamp", "pair", "direction", "entry", "stop", "target",
               "rr", "zone_high", "zone_low", "atr", "regime", "box_broken"]
 
@@ -1458,10 +1472,26 @@ def _collect_trades(client, config):
     return out
 
 
-def run_experiment(client, config):
+def _cost_R(entry_price, S, atr, cost_pct):
+    """Per-trade round-trip cost expressed in R for a given stop multiple S.
+    cost_R = (cost_pct * entry) / (S * atr). Identical for win or loss."""
+    risk = S * atr
+    if risk <= 0:
+        return 0.0
+    return (cost_pct * entry_price) / risk
+
+
+def run_experiment(client, config, cost_pct=None):
     """Sweep stop x target exit rules over the real fired alerts to look for a
     combo that lifts win rate / expectancy. Forward data only (optimises exits on
-    actual signals, not a backtest of entries)."""
+    actual signals, not a backtest of entries).
+
+    Gross numbers are the existing pre-cost figures (unchanged). Net numbers
+    subtract per-trade cost_R = (COST_PCT * entry) / (S * ATR) -- a fixed
+    fraction of entry price re-expressed in R using the cell's stop. Net is
+    additive (printed beside gross), never replaces gross."""
+    if cost_pct is None:
+        cost_pct = COST_PCT
     trades = _collect_trades(client, config)
     if not trades:
         print("No filled trades to experiment on yet - let the bot run longer.")
@@ -1469,14 +1499,18 @@ def run_experiment(client, config):
     nbuy = sum(1 for t in trades if t["is_buy"])
     print(f"Experimenting on {len(trades)} filled, deduped trades "
           f"({nbuy} buy / {len(trades) - nbuy} sell).")
+    print(f"Cost model: round-trip {cost_pct*100:.3f}% of entry price, "
+          f"charged once per trade (win or loss), re-expressed in R.")
     print("WARNING: tiny sample -> everything below is a hypothesis, not proof.\n")
 
     stops = [0.1, 0.2, 0.3, 0.5]
     tgts = [1.0, 1.5, 2.0, 3.0, "full"]
 
     def cell(S, T):
+        """Returns (n_resolved, wr%, gross_exp_R, net_exp_R)."""
         w = l = 0
-        tr = 0.0
+        tr_gross = 0.0
+        tr_net = 0.0
         for t in trades:
             stop = t["entry"] - S * t["atr"] if t["is_buy"] else t["entry"] + S * t["atr"]
             risk = S * t["atr"]
@@ -1485,12 +1519,18 @@ def run_experiment(client, config):
             res = _resolve_seg(t["seg"], t["is_buy"], stop, tgt)
             if res == "win":
                 w += 1
-                tr += abs(tgt - t["entry"]) / risk if risk else 0.0
+                gross = abs(tgt - t["entry"]) / risk if risk else 0.0
+                tr_gross += gross
+                tr_net += gross - _cost_R(t["entry"], S, t["atr"], cost_pct)
             elif res == "loss":
                 l += 1
-                tr -= 1.0
+                tr_gross -= 1.0
+                tr_net += -1.0 - _cost_R(t["entry"], S, t["atr"], cost_pct)
         n = w + l
-        return n, (100.0 * w / n if n else 0.0), (tr / n if n else 0.0)
+        wr = 100.0 * w / n if n else 0.0
+        ge = tr_gross / n if n else 0.0
+        ne = tr_net / n if n else 0.0
+        return n, wr, ge, ne
 
     grid = {(S, T): cell(S, T) for S in stops for T in tgts}
     hdr = "  stop\\tgt" + "".join(f"{(str(x) + 'x' if x != 'full' else 'full'):>8}" for x in tgts)
@@ -1500,14 +1540,31 @@ def run_experiment(client, config):
     for S in stops:
         print(f"  {S:>6.1f} " + "".join(f"{grid[(S, T)][1]:>7.0f}%" for T in tgts))
 
-    print("\nEXPECTANCY R/trade:")
+    print("\nGROSS EXPECTANCY R/trade:")
     print(hdr)
     for S in stops:
         print(f"  {S:>6.1f} " + "".join(f"{grid[(S, T)][2]:>+8.2f}" for T in tgts))
 
-    (bS, bT), (bn, bwr, be) = max(grid.items(), key=lambda kv: kv[1][2])
-    print(f"\nBest expectancy: {be:+.2f}R at stop {bS}xATR + target "
-          f"{bT if bT == 'full' else str(bT) + 'xATR'} (win {bwr:.0f}%, n={bn}).")
+    print(f"\nNET EXPECTANCY R/trade (after cost = {cost_pct*100:.3f}% of entry):")
+    print(hdr)
+    for S in stops:
+        print(f"  {S:>6.1f} " + "".join(f"{grid[(S, T)][3]:>+8.2f}" for T in tgts))
+
+    # Median cost_R per stop tier across all trades, so the toll is visible
+    # without having to recompute it from the matrix delta.
+    print(f"\nMedian cost_R per trade (cost = {cost_pct*100:.3f}% of entry):")
+    for S in stops:
+        cs = sorted(_cost_R(t["entry"], S, t["atr"], cost_pct) for t in trades)
+        median = cs[len(cs) // 2] if cs else 0.0
+        print(f"  stop {S:.1f}xATR : median cost {median:>5.2f}R/trade")
+
+    # Best cell is selected by NET expectancy now -- a +0.22R gross cell that
+    # pays 1.0R/trade in fees isn't actually the best, and the whole reason
+    # we added cost-adjusted output is to stop pretending it is.
+    (bS, bT), (bn, bwr, bge, bne) = max(grid.items(), key=lambda kv: kv[1][3])
+    print(f"\nBest NET expectancy: {bne:+.2f}R (gross {bge:+.2f}R) at "
+          f"stop {bS}xATR + target {bT if bT == 'full' else str(bT) + 'xATR'} "
+          f"(win {bwr:.0f}%, n={bn}).")
     print("With this few trades the 'best' cell is likely overfit - treat as a "
           "direction to confirm as data grows.")
 
@@ -1516,7 +1573,8 @@ def run_experiment(client, config):
     def _subgroup_breakdown(ref_stop, ref_tgt, label):
         def subset(sub):
             w = l = 0
-            tr = 0.0
+            tr_gross = 0.0
+            tr_net = 0.0
             for t in sub:
                 stop = t["entry"] - ref_stop * t["atr"] if t["is_buy"] else t["entry"] + ref_stop * t["atr"]
                 risk = ref_stop * t["atr"]
@@ -1525,48 +1583,59 @@ def run_experiment(client, config):
                 res = _resolve_seg(t["seg"], t["is_buy"], stop, tgt)
                 if res == "win":
                     w += 1
-                    tr += abs(tgt - t["entry"]) / risk if risk else 0.0
+                    gross = abs(tgt - t["entry"]) / risk if risk else 0.0
+                    tr_gross += gross
+                    tr_net += gross - _cost_R(t["entry"], ref_stop, t["atr"], cost_pct)
                 elif res == "loss":
                     l += 1
-                    tr -= 1.0
+                    tr_gross -= 1.0
+                    tr_net += -1.0 - _cost_R(t["entry"], ref_stop, t["atr"], cost_pct)
             n = w + l
-            return n, w, tr
+            return n, w, tr_gross, tr_net
 
         reflabel = (f"stop {ref_stop}xATR + target "
                     f"{ref_tgt if ref_tgt == 'full' else str(ref_tgt) + 'xATR'}")
         print(f"\n--- {label} ({reflabel}) ---")
+        print(f"(net = after cost {cost_pct*100:.3f}% of entry per trade)")
         print("By direction:")
         for dlabel, sub in (("BUY", [t for t in trades if t["is_buy"]]),
                             ("SELL", [t for t in trades if not t["is_buy"]])):
-            n, w, tr = subset(sub)
+            n, w, tg, tn = subset(sub)
             wr = 100.0 * w / n if n else 0.0
-            exp = tr / n if n else 0.0
-            print(f"  {dlabel:<5} n={n:<3} win {wr:>3.0f}%  total {tr:>+7.2f}R  exp {exp:>+.2f}R")
+            ge = tg / n if n else 0.0
+            ne = tn / n if n else 0.0
+            print(f"  {dlabel:<5} n={n:<3} win {wr:>3.0f}%  "
+                  f"gross {tg:>+7.2f}R (exp {ge:>+.2f}R)  "
+                  f"net {tn:>+7.2f}R (exp {ne:>+.2f}R)")
 
         regimes = sorted({t.get("regime", "?") for t in trades})
         if regimes != ["?"]:
             print("\nBy regime (needs data across regimes to be meaningful):")
             for reg in regimes:
                 sub = [t for t in trades if t.get("regime", "?") == reg]
-                n, w, tr = subset(sub)
+                n, w, tg, tn = subset(sub)
                 wr = 100.0 * w / n if n else 0.0
-                exp = tr / n if n else 0.0
-                print(f"  {reg:<8} n={n:<3} win {wr:>3.0f}%  total {tr:>+7.2f}R  exp {exp:>+.2f}R")
+                ge = tg / n if n else 0.0
+                ne = tn / n if n else 0.0
+                print(f"  {reg:<8} n={n:<3} win {wr:>3.0f}%  "
+                      f"gross {tg:>+7.2f}R (exp {ge:>+.2f}R)  "
+                      f"net {tn:>+7.2f}R (exp {ne:>+.2f}R)")
 
         by_coin = {}
         for t in trades:
             by_coin.setdefault(t["pair"], []).append(t)
         rows = []
         for pair, sub in by_coin.items():
-            n, w, tr = subset(sub)
+            n, w, tg, tn = subset(sub)
             if n:
-                rows.append((tr, pair, n, w))
-        rows.sort()  # worst total R first
-        print("\nBy coin (worst total R first):")
-        for tr, pair, n, w in rows:
-            print(f"  {pair:<14} n={n:<3} win {100.0 * w / n:>3.0f}%  total {tr:>+7.2f}R")
+                rows.append((tn, tg, pair, n, w))
+        rows.sort()  # worst NET total R first
+        print("\nBy coin (worst NET total R first):")
+        for tn, tg, pair, n, w in rows:
+            print(f"  {pair:<14} n={n:<3} win {100.0 * w / n:>3.0f}%  "
+                  f"gross {tg:>+7.2f}R  net {tn:>+7.2f}R")
 
-    _subgroup_breakdown(bS, bT, "Breakdown #1 -- best cell")
+    _subgroup_breakdown(bS, bT, "Breakdown #1 -- best NET cell")
     # Second cell: a more tradeable lower-R, higher-win-rate exit so we can
     # eyeball the same direction/regime/coin behaviour at a less lottery-shaped
     # profile than the auto-best.
@@ -1667,6 +1736,10 @@ def parse_args():
     parser.add_argument("--csv", default=None,
                         help="Override the alerts CSV path used by --review "
                              "and --experiment (default: crypto_range_alerts.csv).")
+    parser.add_argument("--cost", type=float, default=None,
+                        help=f"Round-trip cost as a fraction of entry price "
+                             f"for --experiment net columns "
+                             f"(default {COST_PCT}, e.g. --cost 0.0015 for 0.15%%).")
     return parser.parse_args()
 
 
@@ -1697,7 +1770,7 @@ def main():
         return
 
     if args.experiment:
-        run_experiment(client, config)
+        run_experiment(client, config, cost_pct=args.cost)
         return
 
     missing = [name for name, key in (("TELEGRAM_BOT_TOKEN", "telegram_token"),

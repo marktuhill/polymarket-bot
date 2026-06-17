@@ -277,9 +277,14 @@ def f3_trend_alignment(client, t):
 
 
 # ---- metrics ---------------------------------------------------------------
-def metrics(trades, S, T, entry_key="entry", seg_key="seg", anchor_key=None):
+def metrics(trades, S, T, entry_key="entry", seg_key="seg", anchor_key=None,
+            cost_pct=None):
     """Win/loss/R count at one (stop, target) cell. Mirrors run_experiment:
     expectancy denominator is resolved (win+loss); opens excluded.
+
+    Gross numbers match the live --experiment math. Net numbers subtract
+    per-trade cost_R = (cost_pct * entry) / (S * ATR), charged once per trade
+    win or loss. Net is additive (printed alongside gross), never replaces it.
 
     `anchor_key` (optional): when set, stop and target are anchored to
     t[anchor_key] (the ORIGINAL zone-boundary entry), while the segment used
@@ -289,8 +294,11 @@ def metrics(trades, S, T, entry_key="entry", seg_key="seg", anchor_key=None):
     measured from the actual fill price (entry_key), so a confirmed trade that
     fills above support harvests fewer R to the same target -- that's the cost
     of waiting for the rejection, and we want to see it."""
+    if cost_pct is None:
+        cost_pct = crm.COST_PCT
     w = l = opn = 0
-    tr = 0.0
+    tr_gross = 0.0
+    tr_net = 0.0
     for t in trades:
         is_buy, atr = t["is_buy"], t["atr"]
         entry, seg = t[entry_key], t[seg_key]
@@ -299,26 +307,35 @@ def metrics(trades, S, T, entry_key="entry", seg_key="seg", anchor_key=None):
         risk = S * atr
         tgt = anchor + T * atr if is_buy else anchor - T * atr
         res = crm._resolve_seg(seg, is_buy, stop, tgt)
+        # Cost is computed off the ACTUAL fill price (entry_key), since that's
+        # the price you trade at. The stop multiple S sets risk and therefore
+        # the R-denomination -- so a tight stop pays more R/cost than a wide
+        # one on the same coin.
+        cR = crm._cost_R(entry, S, atr, cost_pct)
         if res == "win":
             w += 1
-            # Realized R = distance from actual fill to target / risk (1R).
-            tr += abs(tgt - entry) / risk if risk else 0.0
+            gross = abs(tgt - entry) / risk if risk else 0.0
+            tr_gross += gross
+            tr_net += gross - cR
         elif res == "loss":
             l += 1
-            tr -= 1.0
+            tr_gross -= 1.0
+            tr_net += -1.0 - cR
         else:
             opn += 1
     n = w + l
     return dict(fill=len(trades), n=n, w=w, l=l, opn=opn,
                 wr=(100.0 * w / n if n else 0.0),
-                totalR=tr, exp=(tr / n if n else 0.0))
+                totalR=tr_gross, exp=(tr_gross / n if n else 0.0),
+                totalR_net=tr_net, exp_net=(tr_net / n if n else 0.0))
 
 
 def _row(label, m):
     flag = "  <- n<5, too small to read" if m["fill"] < 5 else ""
     return (f"  {label:<32} fill={m['fill']:<3} resolved={m['n']:<3} "
-            f"win {m['wr']:>3.0f}%  totalR {m['totalR']:>+7.2f}  "
-            f"exp {m['exp']:>+.2f}R{flag}")
+            f"win {m['wr']:>3.0f}%  "
+            f"gross {m['totalR']:>+7.2f}R (exp {m['exp']:>+.2f}R)  "
+            f"net {m['totalR_net']:>+7.2f}R (exp {m['exp_net']:>+.2f}R){flag}")
 
 
 # ---- main ------------------------------------------------------------------
@@ -329,7 +346,12 @@ def main():
                     help="Alerts CSV (default: crypto_range_alerts_deduped.csv).")
     ap.add_argument("--forward", action="store_true",
                     help="Restrict to trades after 2026-06-10 (acceptance sample).")
+    ap.add_argument("--cost", type=float, default=None,
+                    help=f"Round-trip cost as a fraction of entry price for "
+                         f"net columns (default {crm.COST_PCT}, "
+                         f"e.g. --cost 0.0015 for 0.15%%).")
     args = ap.parse_args()
+    cost_pct = args.cost if args.cost is not None else crm.COST_PCT
 
     if hasattr(crm, "setup_logging"):
         crm.setup_logging()
@@ -347,6 +369,8 @@ def main():
     else:
         print("Sample: IN-SAMPLE (all collected trades; hypothesis-generating only)")
     print(f"Registered: {REGISTRATION_DATE:%Y-%m-%d}.  Parameters FIXED at registration.")
+    print(f"Cost model: round-trip {cost_pct*100:.3f}% of entry, "
+          f"charged once per trade (every gross metric has a net twin).")
     print("Predictions on record:")
     print("  F1: confirmed > unconfirmed")
     print("  F2: win rate decays as touches increase (3 > 4 > 5+)")
@@ -392,16 +416,19 @@ def main():
     for (S, T) in CELLS:
         print(f"  @ {S}/{T}:")
         mc = metrics(confirmed, S, T, entry_key="f1_entry",
-                     seg_key="f1_seg", anchor_key="orig_entry")
-        mu = metrics(unconfirmed, S, T)
+                     seg_key="f1_seg", anchor_key="orig_entry",
+                     cost_pct=cost_pct)
+        mu = metrics(unconfirmed, S, T, cost_pct=cost_pct)
         print(_row(f"confirmed [{sample}]", mc))
         print(_row(f"unconfirmed [{sample}]", mu))
         print(f"  by direction @ {S}/{T}:")
         for dc, isbuy in (("BUY", True), ("SELL", False)):
             mc = metrics([t for t in confirmed if t["is_buy"] == isbuy],
                          S, T, entry_key="f1_entry",
-                         seg_key="f1_seg", anchor_key="orig_entry")
-            mu = metrics([t for t in unconfirmed if t["is_buy"] == isbuy], S, T)
+                         seg_key="f1_seg", anchor_key="orig_entry",
+                         cost_pct=cost_pct)
+            mu = metrics([t for t in unconfirmed if t["is_buy"] == isbuy], S, T,
+                         cost_pct=cost_pct)
             print(_row(f"confirmed {dc}", mc))
             print(_row(f"unconfirmed {dc}", mu))
 
@@ -439,9 +466,9 @@ def main():
             print(f"    {c:>3} |  {'#'*hist[c]} ({hist[c]})")
     for (S, T) in CELLS:
         print(f"  @ {S}/{T}:")
-        print(_row(f"touches<=2 [{sample}]", metrics(b2, S, T)))
-        print(_row(f"touches=3 [{sample}]", metrics(b3, S, T)))
-        print(_row(f"touches>=4 [{sample}]", metrics(b4, S, T)))
+        print(_row(f"touches<=2 [{sample}]", metrics(b2, S, T, cost_pct=cost_pct)))
+        print(_row(f"touches=3 [{sample}]", metrics(b3, S, T, cost_pct=cost_pct)))
+        print(_row(f"touches>=4 [{sample}]", metrics(b4, S, T, cost_pct=cost_pct)))
 
     # ----------------------- F3 -----------------------
     print(f"\n=== F3 (HTF trend, D1 EMA{F3_EMA_PERIOD}) [{sample}] ===")
@@ -460,14 +487,16 @@ def main():
     print(f"  classified: aligned={len(aligned)}  counter={len(counter)}")
     for (S, T) in CELLS:
         print(f"  @ {S}/{T}:")
-        print(_row(f"aligned [{sample}]", metrics(aligned, S, T)))
-        print(_row(f"counter [{sample}]", metrics(counter, S, T)))
+        print(_row(f"aligned [{sample}]", metrics(aligned, S, T, cost_pct=cost_pct)))
+        print(_row(f"counter [{sample}]", metrics(counter, S, T, cost_pct=cost_pct)))
         print(f"  by direction @ {S}/{T}:")
         for dc, isbuy in (("BUY", True), ("SELL", False)):
             print(_row(f"aligned {dc}",
-                       metrics([t for t in aligned if t["is_buy"] == isbuy], S, T)))
+                       metrics([t for t in aligned if t["is_buy"] == isbuy],
+                               S, T, cost_pct=cost_pct)))
             print(_row(f"counter {dc}",
-                       metrics([t for t in counter if t["is_buy"] == isbuy], S, T)))
+                       metrics([t for t in counter if t["is_buy"] == isbuy],
+                               S, T, cost_pct=cost_pct)))
     # Overlap of F3 with the existing "short" regime tag.
     short_regime = [t for t in trades if t["regime"] == "short"]
     if short_regime:
